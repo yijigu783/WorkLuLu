@@ -1,0 +1,51 @@
+[package]
+name = "worklog"
+version = "1.0.0"
+description = "工作记录本 - 单文件绿色的本地工作记录与周期排期工具"
+authors = ["worklog"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# 见下方 [dependencies] 中 indexmap 的说明：resolver v2 会隔离 build 依赖的特性集合，
+# 因此这里需要再声明一次，确保 build 依赖图中的 indexmap 也带上 std 特性。
+indexmap = { version = "1.9.3", features = ["std"] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-ico", "image-png"] }
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = "0.4"
+
+# schemars 0.8 (tauri 的间接依赖) 需要 indexmap 1.x。
+# indexmap 1.9.3 通过 autocfg 探测 std：探测失败时会退化成 no_std，
+# 使 `IndexMap<K, V>` 丢掉默认泛型参数 S，导致 schemars 编译报 E0107。
+# 显式打开 std 特性后，构建脚本直接 emit `has_std`，不再做子进程探测。
+indexmap = { version = "1.9.3", features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+# 要「点了通知能跳回那一条工作」，就必须拿到 winrt 的激活回调。
+# tauri-plugin-notification 的 builder 是发完即忘的，只能下探到它底层的这个 crate
+# （本来就在依赖树里，不增加编译量）。
+tauri-winrt-notification = "0.7"
+# 注册通知用的 AUMID 走系统 API 而不是 `reg.exe`：调外部进程既慢，
+# 又容易被安全软件记一笔。windows crate 本来就在依赖树里，只多编一个模块。
+windows = { version = "0.61", features = [
+    "Win32_System_Registry",
+    "Win32_Foundation",
+    # RegCreateKeyExW 的签名里带 SECURITY_ATTRIBUTES，整个函数被这个特性门控着
+    "Win32_Security",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false

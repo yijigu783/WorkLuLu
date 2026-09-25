@@ -1,0 +1,25 @@
+# Rust 构建产物（约 5 GB，绝对不能进仓库）
+/app/src-tauri/target/
+
+# Tauri 构建时生成的 schema
+/app/src-tauri/gen/schemas/
+
+# 交付用的单文件 exe —— 二进制走 GitHub Releases，不进仓库
+/工作记录本.exe
+*.exe
+
+# 视觉校对留下的临时截图（正式素材在 docs/screenshots/）
+/app/tools/_shot_*.png
+/app/tools/_preview/
+/app/tools/_p*/
+/app/tools/_m_*/
+
+# 本地工作笔记，不适合公开
+/.workbuddy/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

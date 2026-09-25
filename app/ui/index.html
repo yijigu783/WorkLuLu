@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>工作记录本</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="titlebar" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region>
+      <span class="brand-mark"></span>
+      <span class="brand-name">工作记录本</span>
+    </div>
+    <div class="titlebar-fill" data-tauri-drag-region></div>
+    <div class="titlebar-actions">
+      <label class="search">
+        <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+          <circle cx="7" cy="7" r="4.6"/><path d="M10.6 10.6 14 14"/>
+        </svg>
+        <input id="search" type="text" placeholder="搜索工作记录…" autocomplete="off" spellcheck="false">
+      </label>
+      <button class="btn btn-primary" id="btn-new">
+        <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <path d="M8 3.5v9M3.5 8h9"/>
+        </svg>
+        新建工作
+      </button>
+      <div class="win-controls">
+        <button class="win-btn" data-win="min" title="最小化">
+          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M2 6h8"/></svg>
+        </button>
+        <button class="win-btn" data-win="max" title="最大化">
+          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.5" y="2.5" width="7" height="7" rx="1"/></svg>
+        </button>
+        <button class="win-btn win-close" data-win="close" title="关闭">
+          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M3 3l6 6M9 3l-6 6"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <nav class="sidebar" id="sidebar"></nav>
+    <main class="content"><div class="view" id="view"></div></main>
+    <aside class="drawer" id="drawer"></aside>
+  </div>
+
+</div>
+
+<!-- 新建 / 编辑 面板 -->
+<div class="modal-mask" id="modal-mask">
+  <div class="modal" id="modal"></div>
+</div>
+
+<script src="assets/app.js"></script>
+</body>
+</html>
