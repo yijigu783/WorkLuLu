@@ -155,6 +155,110 @@ const inv = (cmd, args) => {
   return Promise.reject(new Error('no tauri'));
 };
 
+/* ---------------- 原生文件对话框 ----------------
+   插件自己往 window.__TAURI__.dialog 上挂了一层 JS 包装，优先用它 ——
+   它把 buttons 之类的参数转成了后端要的格式，比手写 invoke 少踩坑。
+   （本项目前端是原生 JS、没有打包器，装不了 @tauri-apps/plugin-dialog，
+   靠的是 tauri.conf.json 里 withGlobalTauri + 插件自带的 api-iife.js。）*/
+function dialogApi() {
+  return (hasTauri && window.__TAURI__ && window.__TAURI__.dialog) || null;
+}
+
+const dlg = (cmd, options) => {
+  const d = dialogApi();
+  if (d && typeof d[cmd] === 'function') return d[cmd](options);
+  if (!hasTauri) return Promise.resolve(null);
+  // 后路：包装没挂上就自己 invoke，参数格式跟包装里是同一套
+  return window.__TAURI__.core.invoke(`plugin:dialog|${cmd}`, { options });
+};
+
+/** 原生确认框，返回用户是不是点了「是」 */
+function askDialog(message, title) {
+  const d = dialogApi();
+  if (d && typeof d.ask === 'function') return d.ask(message, { title, kind: 'Warning' });
+  if (!hasTauri) return Promise.resolve(false);
+  return window.__TAURI__.core
+    .invoke('plugin:dialog|message', { message, title, kind: 'warning', buttons: 'YesNo' })
+    .then(r => r === 'Yes');
+}
+
+/** 备份文件名带时间戳，同一天里连着备份几次也不会互相覆盖 */
+function stampName(ext) {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return `工作记录本-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+         `-${p(d.getHours())}${p(d.getMinutes())}.${ext}`;
+}
+
+/** 对话框默认落在数据目录，用户回头好找 */
+function defaultPathFor(name) {
+  return state.dataPath ? `${state.dataPath}\\${name}` : name;
+}
+
+const DB_FILTER = [{ name: '工作记录本备份', extensions: ['db'] }];
+
+async function backupNow() {
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  try {
+    const dest = await dlg('save', {
+      title: '备份到',
+      defaultPath: defaultPathFor(stampName('db')),
+      filters: DB_FILTER,
+    });
+    if (!dest) return;                      // 用户按了取消
+    await inv('backup_to', { dest });
+    toast('备份完成');
+  } catch (e) {
+    toast(`备份失败：${e}`);
+  }
+}
+
+async function restoreNow() {
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  try {
+    const src = await dlg('open', {
+      title: '选择要恢复的备份文件',
+      multiple: false,
+      directory: false,
+      filters: DB_FILTER,
+    });
+    if (!src) return;
+
+    // 这一步会顶掉全部数据，把话说在前面再让用户点
+    const yes = await askDialog(
+      '恢复会用这个备份完全替换当前的全部工作、分类和完成记录。\n\n' +
+      '恢复之前会自动把现在的数据另存到 backups 文件夹，万一选错了还能切回来。',
+      '确定要恢复吗？',
+    );
+    if (!yes) return;
+
+    const snap = await inv('restore_from', { src });
+    await loadAll();
+    state.drawerId = null;
+    state.view = 'settings';
+    renderAll_();
+    toast('已恢复');
+    console.info('[恢复] 恢复前的数据已另存到', snap);
+  } catch (e) {
+    toast(`恢复失败：${e}`);
+  }
+}
+
+async function exportCsv() {
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  try {
+    const dest = await dlg('save', {
+      title: '导出为 CSV',
+      defaultPath: defaultPathFor(stampName('csv')),
+      filters: [{ name: 'CSV 表格', extensions: ['csv'] }],
+    });
+    if (!dest) return;
+    const n = await inv('export_csv', { dest });
+    toast(`已导出 ${n} 条工作`);
+  } catch (e) {
+    toast(`导出失败：${e}`);
+  }
+}
+
 /* 浏览器预览用示例数据 */
 function mockData() {
   const now = new Date();
@@ -1146,6 +1250,27 @@ function renderSettings() {
     <div class="task-list">
       <div class="task" style="padding:14px">
         <div class="task-main">
+          <div class="task-title">备份数据</div>
+          <div class="task-meta">导出成一个独立的数据库文件，拷到 U 盘或网盘都行</div>
+        </div>
+        <button class="btn btn-ghost" data-act="backup-now">备份…</button>
+      </div>
+      <div class="task" style="padding:14px">
+        <div class="task-main">
+          <div class="task-title">从备份恢复</div>
+          <div class="task-meta">会用它替换当前全部数据；替换前自动把现在的数据另存一份，选错了还能切回来</div>
+        </div>
+        <button class="btn btn-ghost" data-act="restore-now">选择文件…</button>
+      </div>
+      <div class="task" style="padding:14px">
+        <div class="task-main">
+          <div class="task-title">导出为表格</div>
+          <div class="task-meta">存成 CSV，Excel / WPS 直接打开，中文不乱码</div>
+        </div>
+        <button class="btn btn-ghost" data-act="export-csv">导出 CSV</button>
+      </div>
+      <div class="task" style="padding:14px">
+        <div class="task-main">
           <div class="task-title">数据存放位置</div>
           <div class="task-meta">${esc(state.dataPath || '本机用户目录 / worklog.db')}</div>
         </div>
@@ -2031,6 +2156,9 @@ function bind() {
         inv('open_data_dir').catch(err => { console.warn(err); toast('打开目录失败'); });
         return;
       }
+      if (a === 'backup-now')  { backupNow();  return; }
+      if (a === 'restore-now') { restoreNow(); return; }
+      if (a === 'export-csv')  { exportCsv();  return; }
 
       // 抽屉里的即时修改（点了立刻反映在界面上，保存时一并落库）
       if (a === 'set-pattern') {

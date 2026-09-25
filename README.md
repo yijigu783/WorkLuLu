@@ -83,6 +83,21 @@
 - **快捷键**：`Ctrl+N` 新建工作，`Esc` 关闭当前面板
 - **开机自启**：可选，登录后在托盘静默启动
 
+### 备份、恢复与导出
+
+设置页里有两个按钮管数据：
+
+- **备份数据** —— 导出成一个独立的 `.db` 文件，拷到 U 盘或网盘都行。用的是 SQLite 的 `VACUUM INTO` 而不是复制文件：库跑在 WAL 模式下，直接复制可能漏掉还留在 `-wal` 里没并回主文件的改动，而且这种缺失是**静默**的（文件能打开、表也在，等真要用的时候才发现少了最近几天）。
+- **从备份恢复** —— 选中备份文件后完全替换当前数据。这件事不可逆，所以恢复前会**自动把现在的数据另存一份**到 `backups` 文件夹，选错了还能切回来；恢复过程整体放在一个事务里，要么全成要么原样不动。备份文件会先校验（四张表在不在、列数对不对得上），不是本程序导出的、或者版本对不上的，直接拒绝，不会恢复出一半。
+
+另外可以 **导出为 CSV**，Excel / WPS 直接打开（带 UTF-8 BOM，中文不乱码）。
+
+<p>
+  <img src="docs/screenshots/07-settings.png" width="80%" alt="设置页：备份、恢复与导出">
+</p>
+
+这些都走系统原生文件对话框，用的是 Tauri 的 dialog 插件；本项目的 `withGlobalTauri` 开着，所以插件自带的 JS 包装直接就能用，不需要 npm 依赖。
+
 <p>
   <img src="docs/screenshots/05-detail.png" width="49%" alt="工作详情">
   <img src="docs/screenshots/06-new-quarterly.png" width="49%" alt="新建每季度规则">
@@ -99,6 +114,7 @@
 | 位置 | 内容 | 能否删 |
 | --- | --- | --- |
 | `%APPDATA%\工作记录本\` | 数据库 `worklog.db`，你的全部记录 | 删掉即清空数据 |
+| `%APPDATA%\工作记录本\backups\` | 恢复数据前自动留下的快照 | 可以随时删 |
 | `HKCU\Software\Classes\AppUserModelId\com.local.worklog` | 一个通知标识，作用是让系统通知的标题显示「工作记录本」而不是 exe 文件名 | 可删，只是通知标题会变回文件名 |
 
 **数据不在 exe 所在目录**，所以 exe 可以随便挪位置、放 U 盘，数据不受影响。
@@ -167,8 +183,8 @@ docs/                       截图与发布说明
 项目里带了一套防回归脚本，改完代码跑一遍：
 
 ```bash
-cd app/src-tauri && cargo test      # 35 个单测，主要是排期引擎
-cd app && node tools/check_ui.js    # 52 项渲染自检
+cd app/src-tauri && cargo test      # 48 个单测，排期引擎 + 备份恢复
+cd app && node tools/check_ui.js    # 62 项渲染自检
 cd app && node tools/check_stats.js # 8 项统计口径自检
 ```
 
@@ -177,11 +193,12 @@ cd app && node tools/check_stats.js # 8 项统计口径自检
 这些都是有意留着的，不是没做完：
 
 - **没有标签功能**，目前只有分类 + 搜索
-- **没有数据导入导出 / 备份**。要备份请手动复制 `%APPDATA%\工作记录本` 整个文件夹
 - **只有浅色主题**，没做深色模式
 - **只支持 64 位 Windows 10 (1809+) / Windows 11**，不支持 Win7 —— 底层框架已停止支持 Win7，不是偷懒省事
 - **依赖系统的 WebView2 运行时**。Win11 和打过较新补丁的 Win10 都自带；如果双击后没反应，装一次微软官方的 [WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) 即可
 - 如果通知不弹，先检查「设置 → 系统 → 通知」里是否放行了本程序，以及「专注助手（勿扰）」是否开着
+- 备份要手动点，**没有自动定时备份**
+- 恢复是整体替换，**不能合并两份数据**
 
 ## 关于名字
 

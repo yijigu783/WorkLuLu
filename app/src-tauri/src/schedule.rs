@@ -11,6 +11,8 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, Naiv
 const DEFAULT_TIME: (u32, u32) = (9, 0);
 /// 规则没指定星期时按周五——周报这类最常见
 const DEFAULT_WEEKDAY: i64 = 5;
+/// 跟界面上的 WEEK 同序：0 = 周日
+const WEEKDAY_CN: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
 fn parse_hhmm(s: &str) -> Option<NaiveTime> {
     let mut it = s.trim().split(':');
@@ -148,6 +150,67 @@ pub fn advance(
     match (by_due, by_now) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
+    }
+}
+
+/// 把重复规则说成人话，给 CSV 导出这类纯文本场景用。
+///
+/// 文案刻意跟界面上的 `ruleLabel` 对齐：同一件事不该有两种说法。
+/// 比如界面上写「每月 15 日」，导出的表格里也得是「每月 15 日」。
+/// 传进来的解析不了就返回空串——导出时宁可这格空着，也不要写个 `{freq:...}` 进表格。
+pub fn describe_rule(json: &str) -> String {
+    let Ok(rule) = serde_json::from_str::<Rule>(json) else {
+        return String::new();
+    };
+
+    let time = match rule.time.as_deref() {
+        Some(t) if !t.trim().is_empty() => format!(" {t}"),
+        _ => String::new(),
+    };
+
+    // 31 号按「月末」说 —— 排期正是这么算的
+    let day_text = || {
+        let d = want_day(&rule);
+        if d >= 31 {
+            "月末".to_string()
+        } else {
+            format!(" {d} 日")
+        }
+    };
+
+    match rule.freq.as_str() {
+        "daily" => format!("每天{time}"),
+
+        "weekly" => {
+            let days = rule
+                .by_day
+                .clone()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| vec![DEFAULT_WEEKDAY]);
+            let names = days
+                .iter()
+                .map(|d| WEEKDAY_CN[(*d).rem_euclid(7) as usize])
+                .collect::<Vec<_>>()
+                .join("、");
+            format!("每{names}{time}")
+        }
+
+        "monthly" => format!("每月{}{time}", day_text()),
+
+        "quarterly" => {
+            // 锚点月往后每 3 个月取一次，跨年要绕回来（锚点 10 月 → 1/4/7/10 月）
+            let a = anchor_month(&rule) - 1;
+            let mut months: Vec<i64> = (0..4).map(|i| ((a + i * 3) % 12) + 1).collect();
+            months.sort_unstable();
+            let list = months
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("每季度 {list} 月{}{time}", day_text())
+        }
+
+        _ => "自定义".to_string(),
     }
 }
 
@@ -387,5 +450,45 @@ mod tests {
     #[test]
     fn accepts_single_digit_hour() {
         assert_eq!(parse_hhmm("9:00"), NaiveTime::from_hms_opt(9, 0, 0));
+    }
+
+    /* ---- 规则文案（CSV 导出用，跟界面 ruleLabel 对齐）---- */
+
+    #[test]
+    fn describe_covers_every_frequency() {
+        assert_eq!(describe_rule(r#"{"freq":"daily","time":"18:00"}"#), "每天 18:00");
+
+        let w = r#"{"freq":"weekly","byDay":[1,3,5],"time":"09:30"}"#;
+        assert_eq!(describe_rule(w), "每周一、周三、周五 09:30");
+
+        // 没写星期时跟排期引擎一样回落成周五，不能说成「每」
+        assert_eq!(describe_rule(r#"{"freq":"weekly","byDay":[],"time":"08:00"}"#), "每周五 08:00");
+
+        assert_eq!(describe_rule(r#"{"freq":"monthly","byDay":[15],"time":"10:00"}"#), "每月 15 日 10:00");
+        // 31 号要说成「月末」，跟排期里夹到当月最后一天的行为对上
+        assert_eq!(describe_rule(r#"{"freq":"monthly","byDay":[31],"time":"09:00"}"#), "每月月末 09:00");
+    }
+
+    #[test]
+    fn describe_quarterly_lists_the_four_months() {
+        let r = r#"{"freq":"quarterly","byDay":[25],"byMonth":[3],"time":"17:00"}"#;
+        assert_eq!(describe_rule(r), "每季度 3/6/9/12 月 25 日 17:00");
+    }
+
+    /// 锚点月靠后时要绕回来并排好序，不能输出 10/13/16/19 这种不存在的月份
+    #[test]
+    fn describe_quarterly_wraps_past_december() {
+        let r = r#"{"freq":"quarterly","byDay":[1],"byMonth":[10],"time":"08:00"}"#;
+        assert_eq!(describe_rule(r), "每季度 1/4/7/10 月 1 日 08:00");
+    }
+
+    /// 脏数据不该让导出崩，也不能把原始 JSON 漏进表格
+    #[test]
+    fn describe_survives_broken_json() {
+        assert_eq!(describe_rule(""), "");
+        assert_eq!(describe_rule("不是 json"), "");
+        // 缺 freq 时跟界面 ruleLabel 一样落到「自定义」，而不是瞎猜一个频率
+        assert_eq!(describe_rule("{}"), "自定义");
+        assert_eq!(describe_rule(r#"{"freq":"unknown"}"#), "自定义");
     }
 }

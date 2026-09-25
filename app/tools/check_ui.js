@@ -74,7 +74,7 @@ const ctx = {
 };
 vm.createContext(ctx);
 vm.runInContext(
-  body + '\n;globalThis.__api = { state, loadAll, taskRow, subtaskEditor, applySubtaskProgress, subtasksOf, renderDrawer, renderBoard, renderCalendar, laneOf, scopeTasks, bind, openEditor, syncEditorFields, ruleLabel, quarterMonths, dayText, nextOccurrence, defaultRuleFor, FREQS };',
+  body + '\n;globalThis.__api = { state, loadAll, taskRow, subtaskEditor, applySubtaskProgress, subtasksOf, renderDrawer, renderBoard, renderCalendar, laneOf, scopeTasks, bind, openEditor, syncEditorFields, ruleLabel, quarterMonths, dayText, nextOccurrence, defaultRuleFor, FREQS, renderSettings, stampName };',
   ctx,
 );
 
@@ -246,6 +246,32 @@ vm.runInContext(
     nextOn({ freq: 'monthly', byDay: [31], time: '10:00' }, '2026-01-31T11:00:00', false) === '2026-02-28');
   ok('每周五（与后端用例同一组数据）',
     nextOn({ freq: 'weekly', byDay: [5], time: '17:00' }, '2026-09-23T10:00:00') === '2026-09-25');
+
+  /* ---- 设置页的数据管理（备份 / 恢复 / 导出）----
+     这几个按钮点下去是不可逆的（恢复会顶掉全部数据），
+     所以既要有入口，也得把后果写在旁边。 */
+  const settings = api.renderSettings();
+  for (const [label, act] of [
+    ['备份数据', 'backup-now'],
+    ['从备份恢复', 'restore-now'],
+    ['导出为表格', 'export-csv'],
+    ['打开目录', 'open-data-dir'],
+  ]) {
+    ok(`设置页有「${label}」入口`, settings.includes(`data-act="${act}"`));
+  }
+  ok('恢复那条把「会替换全部数据」说明白了',
+    /替换当前全部数据/.test(settings));
+  ok('恢复那条讲了自动留存快照，选错能切回来',
+    /另存一份/.test(settings) && /切回来/.test(settings));
+  ok('设置页仍然标着数据存放位置', /数据存放位置/.test(settings));
+  ok('给用户看的不是数据库内部术语', !/VACUUM|ATTACH/.test(settings));
+
+  /* ---- 备份文件名 ---- */
+  const bakName = api.stampName('db');
+  ok('备份文件名带日期时间，连备份两次不会互相覆盖',
+    /^工作记录本-\d{8}-\d{4}\.db$/.test(bakName));
+  ok('CSV 用同一个命名规则，只是后缀不同',
+    api.stampName('csv').endsWith('.csv') && api.stampName('csv').startsWith('工作记录本-'));
 
   console.log('---- 渲染自检 ----');
   checks.forEach(([s, n, e]) => console.log(`  ${s}  ${n}${e ? '  → ' + e : ''}`));

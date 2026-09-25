@@ -275,6 +275,9 @@ fn main() {
             None,
         ))
         .plugin(tauri_plugin_opener::init())
+        // 备份 / 恢复要用原生文件对话框。前端直接 invoke `plugin:dialog|save` 等，
+        // 不需要 npm 侧的 @tauri-apps/plugin-dialog。
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let conn = db::init(app.handle())?;
             app.manage(AppState { db: Mutex::new(conn) });
@@ -372,6 +375,9 @@ fn main() {
             commands::set_setting,
             commands::data_dir,
             commands::open_data_dir,
+            commands::backup_to,
+            commands::restore_from,
+            commands::export_csv,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

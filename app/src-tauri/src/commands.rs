@@ -572,6 +572,243 @@ pub fn open_data_dir(app: tauri::AppHandle) -> R<()> {
     tauri_plugin_opener::open_path(&dir, None::<String>).map_err(e2s)
 }
 
+/* ---------------- 备份 / 恢复 / 导出 ---------------- */
+
+/// 一份完整备份要有的四张表。少一张就不认。
+const TABLES: [&str; 4] = ["categories", "tasks", "completions", "settings"];
+
+/// 恢复前的自动快照放这儿，跟数据文件同目录，方便一起搬走
+fn backup_dir_of(app: &tauri::AppHandle) -> std::path::PathBuf {
+    crate::db::data_dir(app).join("backups")
+}
+
+/// 两个路径是不是同一个文件。
+/// 用 canonicalize 兜底，免得 `C:\a\b.db` 和 `c:/A/B.DB` 被当成两个文件。
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if let (Ok(x), Ok(y)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        return x == y;
+    }
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+}
+
+/// 把当前库导出成一个独立的文件。
+///
+/// 用 `VACUUM INTO` 而不是复制文件 —— 库跑在 WAL 模式下，最近的改动可能还留在 `-wal` 里
+/// 没并回主文件。直接 `copy` 会导出一份缺数据的备份，而且缺得**悄无声息**：
+/// 文件能打开、表也在，等真要用的时候才发现少了最近几天。
+/// `VACUUM INTO` 生成的是事务一致快照，顺带把空闲页压掉，文件还更小。
+fn write_backup(conn: &Connection, dest: &std::path::Path) -> R<()> {
+    // VACUUM INTO 要求目标不存在；「另存为」对话框已经替我们确认过覆盖了
+    if dest.exists() {
+        std::fs::remove_file(dest).map_err(|e| format!("没法覆盖已有文件：{e}"))?;
+    }
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(e2s)?;
+        }
+    }
+    let dest_str = dest.to_string_lossy().to_string();
+    conn.execute("VACUUM INTO ?1", params![dest_str])
+        .map_err(|e| format!("导出失败：{e}"))?;
+    Ok(())
+}
+
+/// 用备份文件的内容整体替换当前库。
+///
+/// 走 ATTACH + 事务搬迁，而不是替换文件 —— 直接换文件会跟正在用的连接打架
+/// （WAL 还开着、句柄还指着旧文件），而且换到一半失败就彻底没救了。
+/// 放进一个事务里，要么全成，要么原样不动。
+fn read_backup(conn: &mut Connection, src: &std::path::Path) -> R<()> {
+    check_backup(conn, src)?;
+
+    let src_str = src.to_string_lossy().to_string();
+    conn.execute("ATTACH DATABASE ?1 AS bak", params![src_str])
+        .map_err(|e| format!("没法挂载备份文件：{e}"))?;
+
+    let copied = (|| -> R<()> {
+        let tx = conn.transaction().map_err(e2s)?;
+        // 删的顺序顺着外键：先删引用别人的
+        for t in ["completions", "tasks", "categories", "settings"] {
+            tx.execute(&format!("DELETE FROM main.{t}"), []).map_err(e2s)?;
+        }
+        // 插的顺序正好相反：先插被引用的
+        for t in ["categories", "tasks", "completions", "settings"] {
+            tx.execute(&format!("INSERT INTO main.{t} SELECT * FROM bak.{t}"), [])
+                .map_err(e2s)?;
+        }
+        tx.commit().map_err(e2s)
+    })();
+
+    // 不管成败都要摘掉，否则这个连接再也 ATTACH 不了同名库
+    let _ = conn.execute("DETACH DATABASE bak", []);
+    copied
+}
+
+/// 把当前数据导出成一个独立的 .db 文件，返回落盘的路径。
+#[tauri::command]
+pub fn backup_to(state: State<'_, AppState>, dest: String) -> R<String> {
+    let conn = state.db.lock().map_err(e2s)?;
+    write_backup(&conn, std::path::Path::new(&dest))?;
+    Ok(dest)
+}
+
+/// 校验一个文件确实是本程序导出的备份，且结构跟当前版本对得上。
+///
+/// 宁可在这儿拦下来，也不要恢复一半 —— 半旧半新的数据比直接失败更难收拾。
+fn check_backup(conn: &Connection, path: &std::path::Path) -> R<()> {
+    let probe = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("打不开这个文件：{e}"))?;
+
+    for t in TABLES {
+        let want: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_table_info(?1)", params![t], |r| r.get(0))
+            .map_err(e2s)?;
+        let got: i64 = probe
+            .query_row("SELECT count(*) FROM pragma_table_info(?1)", params![t], |r| r.get(0))
+            .map_err(|_| format!("这个文件里读不到 `{t}` 表，不像是工作记录本导出的备份"))?;
+
+        if got == 0 {
+            return Err(format!("这个文件里没有 `{t}` 表，不像是工作记录本导出的备份"));
+        }
+        if got != want {
+            return Err(format!(
+                "备份里的 `{t}` 表是 {got} 列，当前版本是 {want} 列，两边结构对不上，不能直接恢复"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 从备份文件恢复。成功时返回「恢复前自动留存的那一份」的路径，
+/// 用户要是点错了还能再切回来。
+#[tauri::command]
+pub fn restore_from(app: tauri::AppHandle, state: State<'_, AppState>, src: String) -> R<String> {
+    let src_path = std::path::PathBuf::from(&src);
+    if !src_path.is_file() {
+        return Err("找不到这个备份文件".into());
+    }
+
+    let mut conn = state.db.lock().map_err(e2s)?;
+
+    // 别把自己还原到自己：ATTACH 同一个文件会撞锁
+    if let Some(live) = conn.path() {
+        if same_file(std::path::Path::new(live), &src_path) {
+            return Err("这就是当前正在用的数据文件，不需要恢复".into());
+        }
+    }
+
+    // 恢复是破坏性操作，先把「现在」留一份
+    let dir = backup_dir_of(&app);
+    std::fs::create_dir_all(&dir).map_err(e2s)?;
+    let snapshot = dir.join(format!("恢复前-{}.db", now_local().format("%Y%m%d-%H%M%S")));
+    write_backup(&conn, &snapshot)
+        .map_err(|e| format!("恢复前没法保存当前数据快照，为安全起见已中止：{e}"))?;
+
+    read_backup(&mut conn, &src_path)?;
+    Ok(snapshot.to_string_lossy().to_string())
+}
+
+fn pattern_cn(p: &str) -> &'static str {
+    match p {
+        "recurring" => "周期性",
+        "stage" => "阶段性",
+        _ => "一次性",
+    }
+}
+
+fn status_cn(s: &str) -> &'static str {
+    match s {
+        "done" => "已完成",
+        _ => "进行中",
+    }
+}
+
+/// CSV 转义：字段里有逗号、引号或换行就整体加引号，内部引号翻倍
+fn csv_cell(s: &str) -> String {
+    if s.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r')) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// 把 RFC3339 转成本地年月日时分；解析不了就原样返回
+fn human_time(s: &str) -> String {
+    parse_dt(s)
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| s.to_string())
+}
+
+/// 导出全部工作为 CSV。开头写 UTF-8 BOM —— 不然 Excel 会把中文读成乱码。
+/// 返回导出的行数（不含表头）。
+#[tauri::command]
+pub fn export_csv(state: State<'_, AppState>, dest: String) -> R<usize> {
+    const HEAD: &str = "类型,标题,分类,状态,截止/结束,提醒时间,重复规则,备注,创建时间,完成时间";
+
+    let conn = state.db.lock().map_err(e2s)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT CAST(t.id AS TEXT), t.title, COALESCE(c.name, '未分类'), t.pattern, t.status,
+                    COALESCE(t.end_at, t.due_at), t.remind_at, t.rule, t.note, t.created_at, t.completed_at
+             FROM tasks t LEFT JOIN categories c ON c.id = t.category_id
+             WHERE t.parent_id IS NULL
+             ORDER BY t.created_at, t.id",
+        )
+        .map_err(e2s)?;
+
+    let rows = stmt
+        .query_map([], |r| {
+            let v: Vec<Option<String>> = (0..11)
+                .map(|i| r.get::<_, Option<String>>(i))
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(v)
+        })
+        .map_err(e2s)?;
+
+    let mut body = String::from(HEAD);
+    body.push_str("\r\n");
+    let mut n = 0usize;
+
+    for row in rows {
+        let v = row.map_err(e2s)?;
+        let get = |i: usize| v.get(i).and_then(|x| x.clone()).unwrap_or_default();
+
+        let pattern = get(3);
+        let rule = get(7);
+        let rule_text = if pattern == "recurring" {
+            schedule::describe_rule(&rule)
+        } else {
+            String::new()
+        };
+
+        let cells = [
+            pattern_cn(&pattern).to_string(),
+            get(1),                       // 标题
+            get(2),                       // 分类
+            status_cn(&get(4)).to_string(),
+            human_time(&get(5)),          // 截止/结束
+            human_time(&get(6)),          // 提醒
+            rule_text,
+            get(8),                       // 备注
+            human_time(&get(9)),          // 创建
+            human_time(&get(10)),         // 完成
+        ];
+
+        body.push_str(&cells.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(","));
+        body.push_str("\r\n");
+        n += 1;
+    }
+
+    let path = std::path::PathBuf::from(&dest);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(e2s)?;
+        }
+    }
+    std::fs::write(&path, format!("\u{FEFF}{body}")).map_err(|e| format!("写文件失败：{e}"))?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,5 +998,211 @@ mod tests {
         let parent = stage(&conn);
         assert!(insert_subtask(&conn, parent.id, "   ").is_err());
         assert_eq!(subtask_rows(&conn).unwrap().len(), 0);
+    }
+
+    /* ---- 备份 / 恢复 ---- */
+
+    /// 每个测试用独立的临时目录，避免并行跑的时候互相踩
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wl-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("建临时目录");
+        d
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .expect("计数")
+    }
+
+    fn task(conn: &Connection, title: &str) {
+        conn.execute(
+            "INSERT INTO tasks (title, note, pattern, status, sort) VALUES (?1, '', 'once', 'todo', 0)",
+            params![title],
+        )
+        .expect("建任务");
+    }
+
+    /// 备份 → 把数据改坏 → 恢复，最后必须回到备份那一刻的样子。
+    /// 这是整个功能的核心承诺，破了其他都白搭。
+    #[test]
+    fn backup_then_restore_round_trips() {
+        let dir = tmp_dir("round");
+        let bak = dir.join("bak.db");
+
+        let mut live = db();
+        task(&live, "甲");
+        task(&live, "乙");
+        write_backup(&live, &bak).expect("导出");
+
+        // 备份之后又乱动一通
+        live.execute("DELETE FROM tasks", []).unwrap();
+        task(&live, "丙");
+        live.execute("DELETE FROM categories", []).unwrap();
+        assert_eq!(count(&live, "tasks"), 1);
+
+        read_backup(&mut live, &bak).expect("恢复");
+
+        assert_eq!(count(&live, "tasks"), 2, "任务数要回到备份时");
+        assert_eq!(count(&live, "categories"), 1, "分类也要一起回来");
+        let titles: Vec<String> = live
+            .prepare("SELECT title FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(titles, vec!["甲", "乙"], "连内容都得对上，不能只剩个数量");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 恢复要能顶掉「现在的分类」，否则外键会指向已经不存在的行
+    #[test]
+    fn restore_replaces_categories_not_just_tasks() {
+        let dir = tmp_dir("cat");
+        let bak = dir.join("bak.db");
+
+        let mut live = db(); // db() 自带一个「本职工作」
+        write_backup(&live, &bak).expect("导出");
+
+        live.execute("DELETE FROM categories", []).unwrap();
+        live.execute(
+            "INSERT INTO categories (name, color, sort) VALUES ('临时分类', '#000', 0)",
+            [],
+        )
+        .unwrap();
+
+        read_backup(&mut live, &bak).expect("恢复");
+
+        let names: Vec<String> = live
+            .prepare("SELECT name FROM categories")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(names, vec!["本职工作"]);
+        assert_eq!(count(&live, "tasks"), 0, "顺带把任务也清回备份状态");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 随便挑个 sqlite 文件不能当备份用 —— 得在动数据之前就拦下来
+    #[test]
+    fn restore_rejects_a_file_that_is_not_a_backup() {
+        let dir = tmp_dir("bad");
+        let junk = dir.join("junk.db");
+        {
+            let c = Connection::open(&junk).unwrap();
+            c.execute_batch("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);")
+                .unwrap();
+        }
+
+        let mut live = db();
+        task(&live, "不该被弄丢的工作");
+
+        let err = read_backup(&mut live, &junk).expect_err("应当拒绝");
+        assert!(err.contains("不像是工作记录本导出的备份"), "报错要说人话: {err}");
+        assert_eq!(count(&live, "tasks"), 1, "拒绝之后原数据必须毫发无损");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 老版本导出的备份结构不一样，宁可明确报错也不要恢复出半旧半新的库
+    #[test]
+    fn restore_rejects_a_backup_with_a_different_shape() {
+        let dir = tmp_dir("shape");
+        let old = dir.join("old.db");
+        {
+            let c = Connection::open(&old).unwrap();
+            // 四张表都在，但列数跟当前版本对不上
+            c.execute_batch(
+                "CREATE TABLE categories (id INTEGER PRIMARY KEY);
+                 CREATE TABLE tasks (id INTEGER PRIMARY KEY);
+                 CREATE TABLE completions (id INTEGER PRIMARY KEY);
+                 CREATE TABLE settings (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        }
+
+        let mut live = db();
+        task(&live, "也别动我");
+
+        let err = read_backup(&mut live, &old).expect_err("应当拒绝");
+        assert!(err.contains("结构对不上"), "报错要指明原因: {err}");
+        assert_eq!(count(&live, "tasks"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 恢复失败之后连接还得是好的，不能把 ATTACH 挂着不放
+    #[test]
+    fn failed_restore_leaves_the_connection_usable() {
+        let dir = tmp_dir("usable");
+        let junk = dir.join("junk.db");
+        {
+            let c = Connection::open(&junk).unwrap();
+            c.execute_batch("CREATE TABLE x (id INTEGER);").unwrap();
+        }
+
+        let mut live = db();
+        assert!(read_backup(&mut live, &junk).is_err());
+        // 还能正常读写就说明没被挂住
+        task(&live, "恢复失败后照样能建工作");
+        assert_eq!(count(&live, "tasks"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 备份文件里装的是完整数据，换台机器打开就能用
+    #[test]
+    fn backup_file_is_a_standalone_database() {
+        let dir = tmp_dir("standalone");
+        let bak = dir.join("bak.db");
+
+        let live = db();
+        task(&live, "拿去另一台机器");
+        write_backup(&live, &bak).expect("导出");
+
+        let other = Connection::open(&bak).expect("备份文件本身就该是个能打开的库");
+        assert_eq!(count(&other, "tasks"), 1);
+        assert_eq!(count(&other, "categories"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目标已存在时要能覆盖 —— 「另存为」里选个同名文件是最常见的操作
+    #[test]
+    fn backup_overwrites_an_existing_file() {
+        let dir = tmp_dir("overwrite");
+        let bak = dir.join("bak.db");
+        std::fs::write(&bak, "占位文件，等着被覆盖").unwrap();
+
+        let live = db();
+        task(&live, "覆盖测试");
+        write_backup(&live, &bak).expect("应当覆盖");
+
+        let other = Connection::open(&bak).unwrap();
+        assert_eq!(count(&other, "tasks"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- CSV 转义 ---- */
+
+    #[test]
+    fn csv_escapes_only_when_needed() {
+        assert_eq!(csv_cell("普通标题"), "普通标题");
+        assert_eq!(csv_cell("带,逗号"), "\"带,逗号\"");
+        assert_eq!(csv_cell("带\"引号"), "\"带\"\"引号\"");
+        assert_eq!(csv_cell("带\n换行"), "\"带\n换行\"");
+    }
+
+    #[test]
+    fn human_time_formats_or_passes_through() {
+        assert!(!human_time("2026-09-25T17:00:00+08:00").contains('T'));
+        // 解析不了就原样返回，不能把内容吃掉
+        assert_eq!(human_time("乱七八糟"), "乱七八糟");
     }
 }
