@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "default",
+  "description": "工作记录本安卓版默认权限",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

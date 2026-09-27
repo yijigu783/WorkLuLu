@@ -1,0 +1,40 @@
+[package]
+name = "worklog-android"
+# 安卓版单独起步，版本号与桌面版解耦 —— 两条产品线，节奏不一样。
+version = "0.1.0"
+description = "工作记录本 WorkLuLu 安卓版"
+authors = ["JJAI"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+# Tauri 的移动端入口必须从 lib 导出：
+#   staticlib —— 给 Android 链接用（JNI 那一层靠它）
+#   cdylib    —— 给 iOS 用（现在不做，但留着不影响）
+#   rlib      —— 给桌面端复用同一份代码做本地调试
+name = "worklog_android_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# 见下方 [dependencies] 里 indexmap 的说明：resolver v2 会隔离 build 依赖的特性集合，
+# 所以这里必须再声明一次。漏了这一步，交叉编译到安卓时 schemars 直接报 E0107。
+indexmap = { version = "1.9.3", features = ["std"] }
+
+[dependencies]
+# 注意这里**不带 tray-icon**：安卓上没有托盘，带上只会白编一堆东西。
+# 桌面端（app/）那边才需要。
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+# 三端共享业务层。**排期算法不在本工程里** —— 见 core/src/lib.rs 顶部的三条纪律。
+worklog-core = { path = "../../core" }
+
+# ⚠️ 这一行不能省（桌面版同样有，是同一个坑的第二次踩）。
+# schemars 0.8（tauri 的间接依赖）需要 indexmap 1.x；而 indexmap 1.9.3 通过 autocfg
+# 探测 std，**探测失败时会退化成 no_std**，使 `IndexMap<K, V>` 丢掉默认泛型参数 S，
+# 于是 schemars 的 `pub type Map<K,V> = IndexMap<K,V>` 直接报 E0107。
+# 显式打开 std 后构建脚本直接 emit `has_std`，不再做子进程探测。
+# 交叉编译（--target aarch64-linux-android）时探测必然失败，所以这条是硬性的。
+indexmap = { version = "1.9.3", features = ["std"] }

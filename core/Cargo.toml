@@ -1,0 +1,18 @@
+[package]
+name = "worklog-core"
+# 内部共享 crate，不单独发布。版本号刻意与交付版本解耦 ——
+# 交付版本已经要管四个地方（Cargo.toml / tauri.conf.json / 前端常量 / exe 文件名），
+# 不想再加第五处。这里改成纯内部语义：加共享能力才动它。
+version = "0.1.0"
+description = "工作记录本 (WorkLuLu) 三端共享业务层：数据模型与周期排期引擎"
+authors = ["JJAI"]
+edition = "2021"
+rust-version = "1.77"
+
+[dependencies]
+# Rule 要跨端序列化（前端存的是 JSON 文本）。
+serde = { version = "1", features = ["derive"] }
+# describe_rule 要把前端的规则 JSON 解析回 Rule，运行期真的用得到，不是仅测试用。
+serde_json = "1"
+# 排期全部按本地时区算：用户脑子里「每周五 17:00」就是墙上的时钟。
+chrono = "0.4"

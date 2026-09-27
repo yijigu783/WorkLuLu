@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>工作记录本 WorkLuLu</title>
+<style>
+  :root {
+    --bg: #16181d; --card: #1e212b; --line: #2e3342;
+    --text: #e8eaf0; --text-2: #9aa0b4; --accent: #5b8def; --ok: #3ecf8e;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    padding: env(safe-area-inset-top) 16px calc(24px + env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; gap: 14px;
+    max-width: 560px; margin: 0 auto;
+  }
+  h1 { font-size: 19px; margin: 20px 0 2px; letter-spacing: .5px; }
+  .sub { color: var(--text-2); font-size: 13px; margin-bottom: 6px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px 16px;
+  }
+  .card h2 { font-size: 13px; color: var(--text-2); font-weight: 500; margin: 0 0 10px; letter-spacing: .6px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; }
+  .row + .row { border-top: 1px solid var(--line); }
+  .k { color: var(--text-2); flex: none; }
+  .v { text-align: right; word-break: break-all; }
+  .v.ok { color: var(--ok); }
+  .v.bad { color: #ef6b6b; }
+  .note { color: var(--text-2); font-size: 12.5px; line-height: 1.7; }
+  .note b { color: var(--text); font-weight: 500; }
+</style>
+</head>
+<body>
+  <h1>工作记录本 <span style="color:var(--text-2);font-size:14px">WorkLuLu</span></h1>
+  <div class="sub">安卓版 · 骨架自检页</div>
+
+  <div class="card">
+    <h2>运行环境</h2>
+    <div class="row"><span class="k">前端容器</span><span class="v" id="ua">—</span></div>
+    <div class="row"><span class="k">Tauri API</span><span class="v" id="api">—</span></div>
+  </div>
+
+  <div class="card">
+    <h2>三端共享层（排期引擎）</h2>
+    <div class="row"><span class="k">规则描述</span><span class="v" id="desc">—</span></div>
+    <div class="row"><span class="k">下次执行</span><span class="v" id="next">—</span></div>
+  </div>
+
+  <div class="card">
+    <h2>说明</h2>
+    <div class="note">
+      这一页只做一件事：证明 <b>编译链路</b> 和 <b>共享排期引擎</b> 在安卓上是通的。
+      点上面的数字说明整条 Rust 调用链已经跑起来了。<br><br>
+      真正的界面（查看 / 勾选 / 快速新建）和数据层还没搬过来 —— 桌面版的前端是
+      1120px 宽的鼠标布局，直接搬过来点不动，得先做触屏适配。
+    </div>
+  </div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const T = window.__TAURI__;
+
+  $('ua').textContent = /Android/i.test(navigator.userAgent) ? 'Android WebView' : '其他';
+  $('api').textContent = T && T.core ? '已就绪' : '未注入';
+  $('api').className = 'v ' + (T && T.core ? 'ok' : 'bad');
+
+  // 每月最后一天 18:00 —— 故意挑一条要跨月的规则，能真正跑到 clamp 逻辑。
+  const RULE = JSON.stringify({ freq: 'monthly', byDay: [31], time: '18:00' });
+
+  (async () => {
+    if (!T || !T.core) { $('desc').textContent = '无法调用'; return; }
+    try {
+      $('desc').textContent = await T.core.invoke('describe_schedule', { ruleJson: RULE });
+      const next = await T.core.invoke('next_occurrence', {
+        ruleJson: RULE,
+        fromRfc3339: new Date().toISOString(),
+      });
+      $('next').textContent = next ? new Date(next).toLocaleString('zh-CN') : '未算出';
+      $('next').className = 'v ok';
+    } catch (e) {
+      $('desc').textContent = '调用失败';
+      $('desc').className = 'v bad';
+      $('next').textContent = String(e && e.message || e);
+      $('next').className = 'v bad';
+    }
+  })();
+</script>
+</body>
+</html>

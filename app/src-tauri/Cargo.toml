@@ -24,6 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = "0.4"
+# 三端共享业务层（数据模型 + 周期排期引擎）。安卓版依赖同一个 crate，
+# 排期算法因此只有一份实现 —— 见 core/src/lib.rs 顶部的三条纪律。
+worklog-core = { path = "../../core" }
 
 # schemars 0.8 (tauri 的间接依赖) 需要 indexmap 1.x。
 # indexmap 1.9.3 通过 autocfg 探测 std：探测失败时会退化成 no_std，
@@ -45,10 +48,6 @@ windows = { version = "0.61", features = [
     "Win32_Security",
 ] }
 
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
-incremental = false
+# 注意：[profile.release] 已提到工作区根（仓库根的 Cargo.toml）。
+# cargo 会忽略非根成员的 profile 设置，留在这里等于没写 —— 交付 exe 的体积和
+# panic 行为都会变，而且不报错，只在构建时给一行容易被忽略的 warning。

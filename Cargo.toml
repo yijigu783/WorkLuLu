@@ -1,0 +1,31 @@
+# 工作记录本 (WorkLuLu) —— 多端工程工作区
+#
+# 三个成员共享同一份 Cargo.lock，这是刻意的：桌面版和安卓版必须钉在完全相同的
+# 依赖版本上。各建各的锁文件迟早会出现「同一份数据两端行为不同」的问题，而且
+# 极难定位 —— 和「排期算法必须三端一致」是同一个道理。
+#
+# target/ 落在本目录（已 gitignore）。
+
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "app/src-tauri",
+    "android/src-tauri",
+]
+# 日常验桌面版用 `cargo test`（默认只编这两个，快）。
+# 安卓端编得慢，且多数改动跟它无关，要用时显式写 `cargo test --workspace`。
+default-members = [
+    "core",
+    "app/src-tauri",
+]
+
+# 交付体积全靠这一段。**profile 只能写在根**——写在成员 crate 里 cargo 会直接忽略，
+# 且只给一行 warning，很容易漏。少了它 exe 会大一圈，panic 行为也会变回 unwind。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false

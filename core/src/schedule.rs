@@ -4,7 +4,7 @@
 //! 全部按本地时区计算——「每周五 17:00」在用户脑子里就是墙上的时钟，
 //! 换算成 UTC 再算回来只会引入时区偏移的坑。
 
-use crate::commands::Rule;
+use crate::model::Rule;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 
 /// 默认提醒时刻：规则没写时间时用它

@@ -5171,6 +5171,29 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-winrt-notification",
  "windows",
+ "worklog-core",
+]
+
+[[package]]
+name = "worklog-android"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "indexmap 1.9.3",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "worklog-core",
+]
+
+[[package]]
+name = "worklog-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

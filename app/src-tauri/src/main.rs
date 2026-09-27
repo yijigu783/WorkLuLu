@@ -3,7 +3,6 @@
 mod commands;
 mod db;
 mod notify;
-mod schedule;
 
 use rusqlite::{params, OptionalExtension};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -12,6 +11,8 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, Runtime, WindowEvent};
+// 排期引擎在共享层（core）。原来的 `mod schedule;` 已删。
+use worklog_core::schedule;
 
 /// 对外的软件名：中文主名 + 英文副名。
 /// 窗口标题、托盘提示、系统通知的归属名都用它——只用中文，英文用户认不出；

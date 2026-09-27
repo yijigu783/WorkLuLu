@@ -1,10 +1,11 @@
-use crate::schedule;
 use crate::AppState;
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Timelike};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::State;
+// 排期引擎从共享层进来 —— 桌面版和安卓版共用同一份实现，不会各算各的。
+use worklog_core::schedule;
 
 type R<T> = Result<T, String>;
 fn e2s<E: std::fmt::Display>(e: E) -> String {
@@ -29,24 +30,10 @@ pub struct Category {
     pub sort: i64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Rule {
-    #[serde(default)]
-    pub freq: String,
-    /// 语义随 freq 变：
-    /// - weekly   ：星期几（0=周日 … 6=周六），可多选
-    /// - monthly  ：每月几号（1–31，31 表示月末，小月自动夹到最后一天）
-    /// - quarterly：每季度第几个月里的几号，同上
-    #[serde(default)]
-    pub by_day: Option<Vec<i64>>,
-    /// 季度规则的锚点月（1–12）。只取第一个；周期是「锚点月、+3、+6、+9」。
-    /// 例如 3 → 3/6/9/12 月（季末），1 → 1/4/7/10 月（季初）。
-    #[serde(default)]
-    pub by_month: Option<Vec<i64>>,
-    #[serde(default)]
-    pub time: Option<String>,
-}
+// Rule 搬进共享层（core）了 —— 排期引擎和两端的数据库模型都要用它，
+// 留在 commands 里移动端就搬不动。这里重新导出，`commands::Rule` 路径保持不变，
+// 下面 Task.rule / TemplateItem.rule 和 main.rs 的调用都不用改。
+pub use worklog_core::model::Rule;
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
