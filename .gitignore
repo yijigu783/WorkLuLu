@@ -27,6 +27,8 @@
 # 安卓交付包 —— 同上，二进制不进仓库
 *.apk
 *.aab
+# apksigner 生成的 v4 增量签名附属文件
+*.idsig
 
 # 视觉校对留下的临时截图（正式素材在 docs/screenshots/）
 /app/tools/_shot_*.png
