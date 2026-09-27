@@ -1,8 +1,22 @@
 # Rust 构建产物（约 5 GB，绝对不能进仓库）
 /app/src-tauri/target/
+# 建了 workspace 之后 target 会落在仓库根，一并排掉
+/target/
 
 # Tauri 构建时生成的 schema
 /app/src-tauri/gen/schemas/
+
+# 安卓工程里 Gradle 的产物与本地配置
+/android/**/build/
+/android/**/.gradle/
+/android/**/local.properties
+/android/src-tauri/gen/android/app/src/main/assets/*.apk
+/android/src-tauri/gen/android/keystore.properties
+*.jks
+*.keystore
+
+# 源码备份 zip —— 含 .git 全history 与商业策略，绝不可外发
+/backup/
 
 # 交付用的单文件 exe —— 二进制走 GitHub Releases，不进仓库
 /工作记录本.exe

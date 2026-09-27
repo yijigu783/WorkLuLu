@@ -24,7 +24,7 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// 在 HKCU 下注册 AUMID，让通知顶着「工作记录本」而不是 exe 文件名。
+/// 在 HKCU 下注册 AUMID，让通知顶着软件名而不是 exe 文件名。
 ///
 /// 绿色 exe 没进过「程序和功能」，系统不会替我们登记这个身份，
 /// 不登记的话 `CreateToastNotifierWithId` 拿不到归属，通知根本弹不出来。
@@ -54,7 +54,9 @@ pub fn ensure_app_id() {
             return;
         }
 
-        for (name, value) in [("DisplayName", "工作记录本"), ("IconUri", exe.as_str())] {
+        // DisplayName 是「设置 → 通知」里显示的应用名，用中英双名，
+        // 免得用户在那一长串名单里只认得出中文、邮件里又只写英文。
+        for (name, value) in [("DisplayName", crate::APP_NAME), ("IconUri", exe.as_str())] {
             let n = wide(name);
             let v = wide(value);
             let bytes = std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 2);

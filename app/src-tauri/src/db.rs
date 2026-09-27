@@ -62,6 +62,40 @@ CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- 模板：把一套反复要用的工作结构（含各层子任务）存下来，下次一键重建。
+--
+-- 关键设计：日期一律存「相对基准日的偏移天数」，绝不存绝对日期。
+-- 存一个「10 月 8 日截止」，下个月调用时就已经是过去时了；
+-- 存「第 3 天截止」，调用时挑个基准日（默认今天）就能算出真实日期。
+CREATE TABLE IF NOT EXISTS templates (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT    NOT NULL,
+  note       TEXT    NOT NULL DEFAULT '',
+  sort       INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT
+);
+
+-- parent_id 自引用 → 模板天然支持多层结构，和 tasks 表一个路子
+CREATE TABLE IF NOT EXISTS template_items (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+  parent_id   INTEGER REFERENCES template_items(id) ON DELETE CASCADE,
+  title       TEXT    NOT NULL,
+  note        TEXT    NOT NULL DEFAULT '',
+  category_id INTEGER,
+  pattern     TEXT    NOT NULL DEFAULT 'once',
+  rule        TEXT,
+  due_offset  INTEGER,
+  end_offset  INTEGER,
+  -- 时分单独记：偏移只管「第几天」，几点几分得另存，
+  -- 否则「每天 09:30 的晨会」还原出来会变成默认时间
+  due_time    TEXT,
+  end_time    TEXT,
+  sort        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_tpl_items_tpl ON template_items(template_id);
 "#;
 
 /// 数据目录：%APPDATA%\工作记录本

@@ -88,6 +88,15 @@ button { cursor: pointer; }
   border: 1.5px solid #fff; border-radius: 2.5px;
 }
 .brand-name { font-size: 13px; font-weight: 500; letter-spacing: .2px; }
+/* 开关之间的连带提醒：不是错误，是「这么设会有什么后果」，所以用琥珀色而非红色 */
+.warn-text { color: var(--p-once-tx); margin-top: 4px; }
+/* 英文副名：比中文主名轻一档，只是补充说明，不抢视线。
+   标题栏（.brand-sub）和设置页「关于」（.name-en）共用同一套观感。 */
+.brand-sub, .name-en {
+  font-size: 11px; font-weight: 600; letter-spacing: .5px;
+  color: var(--primary); background: var(--primary-soft);
+  padding: 2px 6px; border-radius: 5px; line-height: 1.1;
+}
 .titlebar-fill { flex: 1; height: 100%; }
 
 .titlebar-actions { display: flex; align-items: center; gap: 10px; height: 100%; }
@@ -420,6 +429,9 @@ mark { background: #FBECC2; color: inherit; border-radius: 2px; padding: 0 1px; 
 .modal-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0 22px; }
 .modal-foot { flex: none; display: flex; gap: 8px; padding: 14px 22px 18px; }
 .modal-foot .btn { height: 34px; flex: 1; justify-content: center; }
+/* flex:1 是给「取消 + 确定」并列用的。只剩一个按钮时那样会拉满整行，
+   看着像一条横幅而不是按钮 —— 单按钮一律靠右、按内容定宽。 */
+.modal-foot .btn:only-child { flex: 0 0 auto; min-width: 96px; margin-left: auto; }
 
 .time-row { display: flex; gap: 8px; }
 .time-row .field-input { flex: 1; }
@@ -576,9 +588,29 @@ mark { background: #FBECC2; color: inherit; border-radius: 2px; padding: 0 1px; 
 .sub-del { opacity: 0; transition: opacity .14s, background .13s, color .13s; }
 .sub-item:hover .sub-del, .sub-del:focus-visible { opacity: 1; }
 
+/* 给这一步再分小步。和删除一样平时隐去，移上来才出现 */
+.sub-nest { opacity: 0; transition: opacity .14s, background .13s, color .13s; }
+.sub-item:hover .sub-nest, .sub-nest:focus-visible { opacity: 1; }
+
+/* 三层结构：第二层起缩进，并用一条淡竖线连回父级。
+   只靠缩进的话容易被当成排版错位，看不出谁挂在谁下面 */
+.sub-node[data-depth="2"],
+.sub-node[data-depth="3"] {
+  margin-left: 11px; padding-left: 7px;
+  border-left: 1px solid var(--border);
+}
+
+/* 下级完成情况的小标记，只在这一步确实有下级时才出现 */
+.sub-ratio {
+  flex: none; padding-right: 2px;
+  font-size: 10.5px; color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
 .sub-add { display: flex; gap: 8px; margin-top: 8px; }
 .sub-add .field-input { flex: 1; }
 .sub-add .btn { height: 34px; flex: none; }
+.sub-add-inline { margin: 2px 0 4px 11px; }
 
 /* ---------------- 排布方式切换：列表 / 看板 / 日历 ---------------- */
 /* 挂在页头右上角。用绝对定位而不是把 view-head 改成 flex——
@@ -671,7 +703,11 @@ mark { background: #FBECC2; color: inherit; border-radius: 2px; padding: 0 1px; 
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--r-md);
   display: flex; flex-direction: column; gap: 3px;
+  cursor: pointer;
+  transition: border-color .13s;
 }
+/* 格子整块可点，是「在那天新建」的入口。不给出悬停反馈的话没人知道能点 */
+.cal-cell:hover { border-color: var(--primary); }
 /* 上下月补齐的格子沉到页面底色，一眼分得出「这个月」的边界 */
 .cal-cell.is-out { background: var(--bg); }
 .cal-cell.is-out .cal-date { color: var(--text-3); }
@@ -695,6 +731,74 @@ mark { background: #FBECC2; color: inherit; border-radius: 2px; padding: 0 1px; 
 .cal-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cal-item:hover { background: var(--surface-3); }
 .cal-item.is-done { color: var(--text-3); text-decoration: line-through; }
+/* 跨天任务在跨度内的其余各天：淡一档。
+   看得出「这段时间在忙它」，又不至于和真正交期那条抢注意力 */
+.cal-item.is-span { background: var(--surface-2); opacity: .7; }
+.cal-item.is-span .cal-dot { opacity: .5; }
 .cal-dot { width: 5px; height: 5px; border-radius: 50%; flex: none; }
-.cal-more { font-size: 10.5px; color: var(--text-3); padding-left: 4px; }
+.cal-more {
+  font-size: 10.5px; color: var(--text-3);
+  padding-left: 4px; border-radius: 4px; cursor: pointer;
+}
+.cal-more:hover { color: var(--primary); background: var(--surface-3); }
+
+/* ---------------- 日历格子的右键菜单 ---------------- */
+.ctx-menu {
+  position: fixed; z-index: 60;
+  min-width: 148px; padding: 4px;
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: 0 10px 30px rgba(20, 26, 40, .16);
+}
+.ctx-menu button {
+  text-align: left; padding: 7px 10px;
+  font-size: 12.5px; color: var(--text-1);
+  border-radius: var(--r-sm);
+  transition: background .12s;
+}
+.ctx-menu button:hover { background: var(--surface-2); }
+
+/* ---------------- 模板库 ---------------- */
+.tpl-list { display: flex; flex-direction: column; gap: 8px; }
+.tpl-card {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  transition: border-color .14s, box-shadow .14s;
+}
+.tpl-card:hover { border-color: var(--primary); box-shadow: 0 4px 14px rgba(20, 26, 40, .06); }
+.tpl-main { flex: 1; min-width: 0; }
+.tpl-name { font-size: 13px; font-weight: 500; color: var(--text-1); }
+.tpl-meta {
+  font-size: 11.5px; color: var(--text-3); margin-top: 3px;
+  font-variant-numeric: tabular-nums;
+}
+.tpl-actions { display: flex; gap: 8px; flex: none; }
+.tpl-actions .btn { height: 32px; }
+
+/* ---------------- 「这一天有 N 项」弹窗 ---------------- */
+.day-list { display: flex; flex-direction: column; gap: 2px; }
+.day-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px; border-radius: var(--r-md);
+  cursor: pointer; transition: background .13s;
+}
+.day-item:hover { background: var(--surface-2); }
+.day-item .day-title { flex: 1; min-width: 0; font-size: 12.5px; color: var(--text-1); }
+.day-item.is-done .day-title { color: var(--text-3); text-decoration: line-through; }
+
+/* ---------------- 赞赏码弹窗 ---------------- */
+/* 入口本身不起眼（设置页「关于」里的一个 ghost 按钮），但码必须够大：
+   小于 200px 微信容易扫不出来，260px 是能稳稳扫到的尺寸。 */
+.reward { display: flex; flex-direction: column; align-items: center; gap: 9px; margin: 2px 0 14px; }
+.reward-qr {
+  display: block; width: 260px; height: 260px;
+  border: 1px solid var(--border); border-radius: var(--r-lg);
+  background: #fff;
+}
+.reward-cap { font-size: 11.5px; color: var(--text-3); }
 

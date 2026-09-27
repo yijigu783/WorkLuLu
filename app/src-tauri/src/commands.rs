@@ -1,6 +1,6 @@
 use crate::schedule;
 use crate::AppState;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Timelike};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -454,6 +454,37 @@ pub fn delete_task(state: State<'_, AppState>, id: i64) -> R<()> {
 
 /* ---------------- 子任务（阶段性工作的拆解） ---------------- */
 
+/// 拆解层数上限。顶层工作算第 1 层，往下最多再拆 2 层。
+///
+/// 为什么封顶：工作记录的场景里「这件事分几步、每步再分几步」就到头了。
+/// 再深对使用者没有实际意义，却会让缩进、折叠、进度统计一起复杂化——
+/// 深度没有上界的话，递归渲染也少了一道最关键的护栏。
+pub(crate) const MAX_DEPTH: i64 = 3;
+
+/// 一个节点在第几层。顶层工作（parent_id 为空）返回 1。
+/// 顺带兜住环：万一数据被外部工具改出 A→B→A 这种环，也不会把程序挂死。
+fn depth_of(conn: &Connection, id: i64) -> R<i64> {
+    let mut cur = Some(id);
+    let mut depth = 0i64;
+    while let Some(x) = cur {
+        depth += 1;
+        if depth > 16 {
+            return Err("层级异常，请检查这条工作的父子关系".into());
+        }
+        let row: Option<Option<i64>> = conn
+            .query_row("SELECT parent_id FROM tasks WHERE id = ?1", params![x], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .optional()
+            .map_err(e2s)?;
+        match row {
+            Some(p) => cur = p,
+            None => return Err("要挂在哪个工作下面？父任务找不到了".into()),
+        }
+    }
+    Ok(depth)
+}
+
 /// 新建子任务。分类跟随父任务——子任务单独挂分类没有意义，
 /// 而且统计按分类汇总时会把「一步」算成「一件工作」。
 ///
@@ -463,6 +494,8 @@ pub(crate) fn insert_subtask(conn: &Connection, parent_id: i64, title: &str) -> 
     if title.is_empty() {
         return Err("子任务不能没有名字".into());
     }
+
+    let parent_depth = depth_of(conn, parent_id)?;
     let (pattern, category_id): (String, Option<i64>) = conn
         .query_row(
             "SELECT pattern, category_id FROM tasks WHERE id = ?1",
@@ -470,7 +503,14 @@ pub(crate) fn insert_subtask(conn: &Connection, parent_id: i64, title: &str) -> 
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|_| "要挂在哪个工作下面？父任务找不到了".to_string())?;
-    if pattern != "stage" {
+
+    if parent_depth >= MAX_DEPTH {
+        return Err(format!("最多拆到第 {MAX_DEPTH} 层"));
+    }
+    // 顶层工作必须是「阶段性」才谈得上拆解：
+    // 一次性、周期性工作本身就是一件事，把「一步」挂在它下面会让待办计数失真。
+    // 第 2 层以下不受这条约束——那已经是「一步」了，给它再分小步是合理的。
+    if parent_depth == 1 && pattern != "stage" {
         return Err("只有阶段性工作可以拆分子任务".into());
     }
 
@@ -511,6 +551,364 @@ pub fn rename_subtask(state: State<'_, AppState>, id: i64, title: String) -> R<T
     )
     .map_err(e2s)?;
     fetch_task(&conn, id)
+}
+
+/* ---------------- 复制一份 ---------------- */
+
+/// 按「父先于子」的顺序展开一棵子树（不含根）。
+/// 复制和存模板都要照这个顺序落库，父的 id 映射才能先就位。
+fn collect_subtree(conn: &Connection, root: i64, out: &mut Vec<Task>) -> R<()> {
+    let kids = {
+        let mut stmt = conn
+            .prepare("SELECT * FROM tasks WHERE parent_id = ?1 ORDER BY sort, id")
+            .map_err(e2s)?;
+        let rows = stmt.query_map(params![root], row_to_task).map_err(e2s)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(e2s)?
+    };
+    for k in kids {
+        let id = k.id;
+        out.push(k);
+        collect_subtree(conn, id, out)?;
+    }
+    Ok(())
+}
+
+/// 把 ISO 时间整体挪几天，时分保持不变。
+fn shift_days(iso: &Option<String>, days: i64) -> Option<String> {
+    if days == 0 {
+        return iso.clone();
+    }
+    let d = parse_dt(iso.as_ref()?)?;
+    Some((d + chrono::Duration::days(days)).to_rfc3339())
+}
+
+/// 复制一件工作，连同它下面拆出来的所有层级。
+///
+/// 「这件事我下周还要再做一遍」是高频场景，靠模板库去覆盖太重了——
+/// 就地复制最省事：不碰表结构，也用不着先攒出一个模板。
+///
+/// 日期按「整体平移」处理：原件从哪天开始，副本就从 `base` 那天开始，
+/// 内部各步骤之间的相对间隔原样保留。不平移的话，复制出来的东西排期全落在过去。
+pub(crate) fn duplicate_task_inner(conn: &Connection, id: i64, base: Option<&str>) -> R<Task> {
+    let src = fetch_task(conn, id)?;
+    let mut kids = Vec::new();
+    collect_subtree(conn, id, &mut kids)?;
+
+    let from = src.due_at.as_deref().and_then(parse_dt).map(|d| d.date_naive());
+    let to = base
+        .and_then(|s| NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
+        .or(from);
+    let shift = match (from, to) {
+        (Some(f), Some(t)) => (t - f).num_days(),
+        _ => 0,
+    };
+
+    // 周期任务不照搬旧时间：照搬会让复制出来的那条一出生就是逾期状态，
+    // 按规则重新排一次期才是它该在的位置。
+    let due = if src.pattern == "recurring" {
+        src.rule
+            .as_ref()
+            .and_then(|r| schedule::next_from(r, now_local()))
+            .map(|d| d.to_rfc3339())
+            .or_else(|| shift_days(&src.due_at, shift))
+    } else {
+        shift_days(&src.due_at, shift)
+    };
+
+    // 顶层挂个「副本」字样，一眼分得清哪条是复制出来的；
+    // 子任务不加——否则一整棵树上全是这几个字，反而看不清。
+    let title = if src.parent_id.is_none() {
+        format!("{}（副本）", src.title)
+    } else {
+        src.title.clone()
+    };
+    let rule = src.rule.as_ref().and_then(|r| serde_json::to_string(r).ok());
+    let now = now_local().to_rfc3339();
+
+    conn.execute(
+        "INSERT INTO tasks (title, note, category_id, pattern, status, due_at, end_at, remind_at,
+                            rule, progress, parent_id, sort, created_at)
+         VALUES (?1,?2,?3,?4,'todo',?5,?6,?7,?8,NULL,?9,0,?10)",
+        params![
+            title, src.note, src.category_id, src.pattern, due,
+            shift_days(&src.end_at, shift), shift_days(&src.remind_at, shift),
+            rule, src.parent_id, now
+        ],
+    )
+    .map_err(e2s)?;
+    let root_id = conn.last_insert_rowid();
+
+    let mut map: HashMap<i64, i64> = HashMap::new();
+    map.insert(src.id, root_id);
+    // kids 是深度优先的前序序列，父一定在子之前；用它在兄弟间维持原有先后
+    for (i, k) in kids.iter().enumerate() {
+        let Some(pid) = k.parent_id.and_then(|p| map.get(&p).copied()) else { continue };
+        let krule = k.rule.as_ref().and_then(|r| serde_json::to_string(r).ok());
+        conn.execute(
+            "INSERT INTO tasks (title, note, category_id, pattern, status, due_at, end_at, remind_at,
+                                rule, progress, parent_id, sort, created_at)
+             VALUES (?1,?2,?3,?4,'todo',?5,?6,?7,?8,NULL,?9,?10,?11)",
+            params![
+                k.title, k.note, k.category_id, k.pattern,
+                shift_days(&k.due_at, shift), shift_days(&k.end_at, shift),
+                shift_days(&k.remind_at, shift), krule, pid, i as i64, now
+            ],
+        )
+        .map_err(e2s)?;
+        map.insert(k.id, conn.last_insert_rowid());
+    }
+
+    fetch_task(conn, root_id)
+}
+
+/// `base` 是副本的起始日（YYYY-MM-DD）。不给就原地复制、日期不动。
+#[tauri::command]
+pub fn duplicate_task(state: State<'_, AppState>, id: i64, base: Option<String>) -> R<Task> {
+    let conn = state.db.lock().map_err(e2s)?;
+    duplicate_task_inner(&conn, id, base.as_deref())
+}
+
+/* ---------------- 模板 ---------------- */
+
+/// 模板里的一个条目。日期是**相对基准日的偏移**，不是绝对日期——
+/// 这是整个模板功能的关键，见 db.rs 里建表时的说明。
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateItem {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub title: String,
+    pub note: String,
+    pub category_id: Option<i64>,
+    pub pattern: String,
+    pub rule: Option<Rule>,
+    pub due_offset: Option<i64>,
+    pub end_offset: Option<i64>,
+    pub due_time: Option<String>,
+    pub end_time: Option<String>,
+    pub sort: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Template {
+    pub id: i64,
+    pub name: String,
+    pub note: String,
+    pub created_at: Option<String>,
+    pub items: Vec<TemplateItem>,
+}
+
+/// 从 ISO 时间里取出「HH:MM」。取不出来就返回 None，由调用方决定用什么默认值。
+fn hm_of(iso: &Option<String>) -> Option<String> {
+    let d = parse_dt(iso.as_ref()?)?;
+    Some(format!("{:02}:{:02}", d.hour(), d.minute()))
+}
+
+/// 「HH:MM」→ (时, 分)。解析不出来就用默认值，绝不因为一个时间串不正常就整批建不出来。
+fn parse_hm(s: &Option<String>, dflt: (u32, u32)) -> (u32, u32) {
+    s.as_deref()
+        .and_then(|t| t.split_once(':'))
+        .and_then(|(h, m)| Some((h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?)))
+        .filter(|(h, m)| *h < 24 && *m < 60)
+        .unwrap_or(dflt)
+}
+
+fn read_template(conn: &Connection, id: i64) -> R<Template> {
+    let (name, note, created_at): (String, String, Option<String>) = conn
+        .query_row(
+            "SELECT name, note, created_at FROM templates WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(e2s)?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, parent_id, title, note, category_id, pattern, rule,
+                    due_offset, end_offset, due_time, end_time, sort
+             FROM template_items WHERE template_id = ?1 ORDER BY sort, id",
+        )
+        .map_err(e2s)?;
+    let items = stmt
+        .query_map(params![id], |r| {
+            let rule: Option<String> = r.get(6)?;
+            Ok(TemplateItem {
+                id: r.get(0)?,
+                parent_id: r.get(1)?,
+                title: r.get(2)?,
+                note: r.get(3)?,
+                category_id: r.get(4)?,
+                pattern: r.get(5)?,
+                rule: rule.and_then(|s| serde_json::from_str(&s).ok()),
+                due_offset: r.get(7)?,
+                end_offset: r.get(8)?,
+                due_time: r.get(9)?,
+                end_time: r.get(10)?,
+                sort: r.get(11)?,
+            })
+        })
+        .map_err(e2s)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(e2s)?;
+
+    Ok(Template { id, name, note, created_at, items })
+}
+
+/// 把一件工作（含各层步骤）存成模板。
+/// 基准日取根任务的开始日——所有偏移都相对它算，这样模板才有「结构」而没有「日期」。
+pub(crate) fn template_from_task(conn: &Connection, task_id: i64, name: &str) -> R<Template> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("给模板起个名字吧".into());
+    }
+    let root = fetch_task(conn, task_id)?;
+    let mut kids = Vec::new();
+    collect_subtree(conn, task_id, &mut kids)?;
+
+    let base = root
+        .due_at
+        .as_deref()
+        .and_then(parse_dt)
+        .map(|d| d.date_naive())
+        .unwrap_or_else(|| now_local().date_naive());
+    let off = |iso: &Option<String>| {
+        iso.as_deref()
+            .and_then(parse_dt)
+            .map(|d| (d.date_naive() - base).num_days())
+    };
+
+    let sort: i64 = conn
+        .query_row("SELECT COALESCE(MAX(sort), -1) + 1 FROM templates", [], |r| r.get(0))
+        .map_err(e2s)?;
+    conn.execute(
+        "INSERT INTO templates (name, note, sort, created_at) VALUES (?1, '', ?2, ?3)",
+        params![name, sort, now_local().to_rfc3339()],
+    )
+    .map_err(e2s)?;
+    let tpl_id = conn.last_insert_rowid();
+
+    let mut all = vec![root.clone()];
+    all.extend(kids);
+    let mut map: HashMap<i64, i64> = HashMap::new();
+    for (i, t) in all.iter().enumerate() {
+        let parent_item = t.parent_id.and_then(|p| map.get(&p).copied());
+        let rule = t.rule.as_ref().and_then(|r| serde_json::to_string(r).ok());
+        conn.execute(
+            "INSERT INTO template_items (template_id, parent_id, title, note, category_id,
+                                         pattern, rule, due_offset, end_offset,
+                                         due_time, end_time, sort)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                tpl_id, parent_item, t.title, t.note, t.category_id, t.pattern, rule,
+                off(&t.due_at), off(&t.end_at), hm_of(&t.due_at), hm_of(&t.end_at),
+                i as i64
+            ],
+        )
+        .map_err(e2s)?;
+        map.insert(t.id, conn.last_insert_rowid());
+    }
+
+    read_template(conn, tpl_id)
+}
+
+/// 按模板建一批工作。`base` 是基准日，各条目的真实日期 = 基准日 + 各自偏移。
+/// 返回新建的顶层工作条数。
+pub(crate) fn apply_template_inner(conn: &Connection, template_id: i64, base: &str) -> R<i64> {
+    let base_date = NaiveDate::parse_from_str(base.trim(), "%Y-%m-%d")
+        .map_err(|_| "基准日期格式不对，应该像 2026-10-01 这样".to_string())?;
+    let tpl = read_template(conn, template_id)?;
+    if tpl.items.is_empty() {
+        return Err("这个模板里还没有内容".into());
+    }
+
+    let at = |off: Option<i64>, hm: (u32, u32)| -> Option<String> {
+        let d = base_date + chrono::Duration::days(off?);
+        let ndt = d.and_hms_opt(hm.0, hm.1, 0)?;
+        Local.from_local_datetime(&ndt).earliest().map(|x| x.to_rfc3339())
+    };
+
+    let now = now_local().to_rfc3339();
+    let mut map: HashMap<i64, i64> = HashMap::new();
+    let mut top = 0i64;
+
+    // items 是按写入顺序读出来的（父一定排在子前面），所以父的 id 映射必然已经就位
+    for it in &tpl.items {
+        let parent = it.parent_id.and_then(|p| map.get(&p).copied());
+        // 分类可能早被删了。为一个分类没了就拒绝建整批工作，代价太大，落到「未分类」即可
+        let cat: Option<i64> = match it.category_id {
+            Some(c) => conn
+                .query_row("SELECT id FROM categories WHERE id = ?1", params![c], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .optional()
+                .map_err(e2s)?,
+            None => None,
+        };
+
+        let due = if it.pattern == "recurring" {
+            it.rule
+                .as_ref()
+                .and_then(|r| schedule::next_from(r, now_local()))
+                .map(|d| d.to_rfc3339())
+        } else {
+            at(it.due_offset, parse_hm(&it.due_time, (18, 0)))
+        };
+        let end = at(it.end_offset, parse_hm(&it.end_time, (23, 59)));
+        let rule = it.rule.as_ref().and_then(|r| serde_json::to_string(r).ok());
+
+        conn.execute(
+            "INSERT INTO tasks (title, note, category_id, pattern, status, due_at, end_at, remind_at,
+                                rule, progress, parent_id, sort, created_at)
+             VALUES (?1,?2,?3,?4,'todo',?5,?6,NULL,?7,NULL,?8,?9,?10)",
+            params![it.title, it.note, cat, it.pattern, due, end, rule, parent, it.sort, now],
+        )
+        .map_err(e2s)?;
+        map.insert(it.id, conn.last_insert_rowid());
+        if parent.is_none() {
+            top += 1;
+        }
+    }
+
+    Ok(top)
+}
+
+/// 全部模板，含各自的条目。抽出来是为了能脱离 Tauri 的 State 写测试。
+pub(crate) fn all_templates(conn: &Connection) -> R<Vec<Template>> {
+    let ids = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM templates ORDER BY sort, id")
+            .map_err(e2s)?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).map_err(e2s)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(e2s)?
+    };
+    ids.into_iter().map(|id| read_template(conn, id)).collect()
+}
+
+#[tauri::command]
+pub fn list_templates(state: State<'_, AppState>) -> R<Vec<Template>> {
+    let conn = state.db.lock().map_err(e2s)?;
+    all_templates(&conn)
+}
+
+#[tauri::command]
+pub fn save_template(state: State<'_, AppState>, task_id: i64, name: String) -> R<Template> {
+    let conn = state.db.lock().map_err(e2s)?;
+    template_from_task(&conn, task_id, &name)
+}
+
+#[tauri::command]
+pub fn apply_template(state: State<'_, AppState>, id: i64, base: String) -> R<i64> {
+    let conn = state.db.lock().map_err(e2s)?;
+    apply_template_inner(&conn, id, &base)
+}
+
+#[tauri::command]
+pub fn delete_template(state: State<'_, AppState>, id: i64) -> R<()> {
+    let conn = state.db.lock().map_err(e2s)?;
+    conn.execute("DELETE FROM templates WHERE id = ?1", params![id])
+        .map_err(e2s)?;
+    Ok(())
 }
 
 /* ---------------- 设置 ---------------- */
@@ -563,6 +961,14 @@ pub fn data_dir(app: tauri::AppHandle) -> R<String> {
     Ok(crate::db::data_dir(&app).to_string_lossy().to_string())
 }
 
+/// 界面「关于」里显示的版本号。
+/// 从打包进 exe 的包信息里读（AppHandle 自带的方法），不在前端另写一份常量 ——
+/// 两处各写一个版本号，改了一处忘了另一处，用户看到的就和 exe 属性对不上了。
+#[tauri::command]
+pub fn app_version(app: tauri::AppHandle) -> R<String> {
+    Ok(app.package_info().version.to_string())
+}
+
 /// 在资源管理器里打开数据目录。
 /// 走 Rust 侧 API 而非 JS 的 `plugin:opener|open_path`，免去 ACL 路径白名单配置。
 #[tauri::command]
@@ -575,7 +981,13 @@ pub fn open_data_dir(app: tauri::AppHandle) -> R<()> {
 /* ---------------- 备份 / 恢复 / 导出 ---------------- */
 
 /// 一份完整备份要有的四张表。少一张就不认。
+/// 备份里**必须**有的表。少一张就不是本程序导出的备份。
 const TABLES: [&str; 4] = ["categories", "tasks", "completions", "settings"];
+
+/// 后来才加进来的模块（模板库）。
+/// 老备份里没有它们——为一张新增的表去拒绝一个旧备份，用户会平白丢掉全部数据。
+/// 所以按「有就一起搬、没有就跳过」处理：可选，但一旦存在就得列数对得上。
+const OPTIONAL_TABLES: [&str; 2] = ["templates", "template_items"];
 
 /// 恢复前的自动快照放这儿，跟数据文件同目录，方便一起搬走
 fn backup_dir_of(app: &tauri::AppHandle) -> std::path::PathBuf {
@@ -625,14 +1037,41 @@ fn read_backup(conn: &mut Connection, src: &std::path::Path) -> R<()> {
     conn.execute("ATTACH DATABASE ?1 AS bak", params![src_str])
         .map_err(|e| format!("没法挂载备份文件：{e}"))?;
 
+    // 备份里有没有模板表，决定这次要不要一起搬。
+    // 1.0.x 建的备份里没有这两张表，硬搬会直接报「no such table」
+    let has_tpl: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bak.sqlite_master WHERE type = 'table' AND name = 'templates'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
     let copied = (|| -> R<()> {
         let tx = conn.transaction().map_err(e2s)?;
-        // 删的顺序顺着外键：先删引用别人的
-        for t in ["completions", "tasks", "categories", "settings"] {
+        // 删的顺序顺着外键：先删引用别人的。
+        // 模板那两张只在有新数据的备份里才动，否则会把用户现有的模板平白清掉
+        for t in ["completions", "tasks"] {
+            tx.execute(&format!("DELETE FROM main.{t}"), []).map_err(e2s)?;
+        }
+        if has_tpl > 0 {
+            for t in ["template_items", "templates"] {
+                tx.execute(&format!("DELETE FROM main.{t}"), []).map_err(e2s)?;
+            }
+        }
+        for t in ["categories", "settings"] {
             tx.execute(&format!("DELETE FROM main.{t}"), []).map_err(e2s)?;
         }
         // 插的顺序正好相反：先插被引用的
-        for t in ["categories", "tasks", "completions", "settings"] {
+        tx.execute("INSERT INTO main.categories SELECT * FROM bak.categories", [])
+            .map_err(e2s)?;
+        if has_tpl > 0 {
+            for t in ["templates", "template_items"] {
+                tx.execute(&format!("INSERT INTO main.{t} SELECT * FROM bak.{t}"), [])
+                    .map_err(e2s)?;
+            }
+        }
+        for t in ["tasks", "completions", "settings"] {
             tx.execute(&format!("INSERT INTO main.{t} SELECT * FROM bak.{t}"), [])
                 .map_err(e2s)?;
         }
@@ -659,7 +1098,7 @@ fn check_backup(conn: &Connection, path: &std::path::Path) -> R<()> {
     let probe = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("打不开这个文件：{e}"))?;
 
-    for t in TABLES {
+    for t in TABLES.iter().copied().chain(OPTIONAL_TABLES.iter().copied()) {
         let want: i64 = conn
             .query_row("SELECT count(*) FROM pragma_table_info(?1)", params![t], |r| r.get(0))
             .map_err(e2s)?;
@@ -667,7 +1106,11 @@ fn check_backup(conn: &Connection, path: &std::path::Path) -> R<()> {
             .query_row("SELECT count(*) FROM pragma_table_info(?1)", params![t], |r| r.get(0))
             .map_err(|_| format!("这个文件里读不到 `{t}` 表，不像是工作记录本导出的备份"))?;
 
+        // 可选表允许整个不存在（1.0.x 建的备份里就没有模板表），但存在就得对得上列数
         if got == 0 {
+            if OPTIONAL_TABLES.contains(&t) {
+                continue;
+            }
             return Err(format!("这个文件里没有 `{t}` 表，不像是工作记录本导出的备份"));
         }
         if got != want {
@@ -812,7 +1255,7 @@ pub fn export_csv(state: State<'_, AppState>, dest: String) -> R<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{NaiveDate, TimeZone};
 
     fn db() -> Connection {
         let c = Connection::open_in_memory().expect("内存库");
@@ -1000,6 +1443,256 @@ mod tests {
         assert_eq!(subtask_rows(&conn).unwrap().len(), 0);
     }
 
+    #[test]
+    fn subtasks_nest_three_levels_but_no_deeper() {
+        let conn = db();
+        let l1 = stage(&conn);
+        let l2 = insert_subtask(&conn, l1.id, "移动端适配").unwrap();
+        let l3 = insert_subtask(&conn, l2.id, "窄屏走查").expect("第二层下面还能再拆一层");
+
+        assert_eq!(l3.parent_id, Some(l2.id));
+        assert_eq!(subtask_rows(&conn).unwrap().len(), 2);
+
+        // 第三层是底，再往下就该被挡住
+        let err = match insert_subtask(&conn, l3.id, "再分一层") {
+            Err(e) => e,
+            Ok(_) => panic!("第四层不该允许"),
+        };
+        assert!(err.contains("最多"), "报错要说清是层数到了：{err}");
+        assert_eq!(subtask_rows(&conn).unwrap().len(), 2, "被拒的那条不该落库");
+    }
+
+    #[test]
+    fn a_nested_step_can_hold_children_even_though_it_is_not_stage() {
+        let conn = db();
+        let l1 = stage(&conn);
+        let l2 = insert_subtask(&conn, l1.id, "移动端适配").unwrap();
+
+        // 第二层的步骤本身是 once，但它已经是「一步」了，
+        // 给它再分小步是合理的——「只有阶段性才能拆」这条只对顶层成立
+        let l3 = insert_subtask(&conn, l2.id, "窄屏走查").unwrap();
+        assert_eq!(l3.pattern, "once");
+        assert_eq!(l3.category_id, Some(1), "隔了一层也要继承最上面那个分类");
+    }
+
+    #[test]
+    fn depth_guard_survives_a_cycle_in_the_data() {
+        let conn = db();
+        let a = stage(&conn);
+        let b = insert_subtask(&conn, a.id, "第一步").unwrap();
+        // 人为造一个环：把父任务挂到它自己的子任务下面。
+        // 外部工具改库可能出现这种数据，遍历必须能自己停下来
+        conn.execute("UPDATE tasks SET parent_id = ?1 WHERE id = ?2", params![b.id, a.id])
+            .unwrap();
+        assert!(depth_of(&conn, b.id).is_err(), "有环时必须报错，而不是转不出来");
+    }
+
+    /* ---------------- 复制一份 ---------------- */
+
+    /// 把某个任务的开始 / 交期固定下来，方便对着算天数
+    fn set_span(conn: &Connection, id: i64, due: Option<&str>, end: Option<&str>) {
+        conn.execute(
+            "UPDATE tasks SET due_at = ?1, end_at = ?2 WHERE id = ?3",
+            params![due, end, id],
+        )
+        .expect("设置日期");
+    }
+
+    #[test]
+    fn duplicating_a_task_brings_its_steps_and_shifts_the_dates() {
+        let conn = db();
+        let parent = stage(&conn);
+        set_span(&conn, parent.id, Some("2026-10-01T09:00:00+08:00"), Some("2026-10-10T23:59:00+08:00"));
+        insert_subtask(&conn, parent.id, "第一步").unwrap();
+        insert_subtask(&conn, parent.id, "第二步").unwrap();
+
+        let copy = duplicate_task_inner(&conn, parent.id, Some("2026-11-01")).expect("复制");
+
+        assert_ne!(copy.id, parent.id);
+        assert!(copy.title.ends_with("（副本）"), "顶层要一眼看出是复制来的：{}", copy.title);
+        assert_eq!(copy.status, "todo", "副本从没做过开始");
+
+        // 整体平移：10/1 → 11/1 是 +31 天，内部跨度（9 天）不变
+        let due = parse_dt(copy.due_at.as_deref().unwrap()).unwrap();
+        let end = parse_dt(copy.end_at.as_deref().unwrap()).unwrap();
+        assert_eq!(due.date_naive(), NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+        assert_eq!(due.time().to_string(), "09:00:00", "时分不该被平移改掉");
+        assert_eq!((end.date_naive() - due.date_naive()).num_days(), 9, "跨度不能被改");
+
+        let kids: Vec<Task> = subtask_rows(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.parent_id == Some(copy.id))
+            .collect();
+        assert_eq!(kids.len(), 2, "子任务要跟着复制");
+        assert!(
+            kids.iter().all(|k| !k.title.contains("副本")),
+            "只有顶层加「副本」字样，否则一棵树上全是这几个字"
+        );
+    }
+
+    #[test]
+    fn duplicating_keeps_the_whole_nested_tree() {
+        let conn = db();
+        let l1 = stage(&conn);
+        let l2 = insert_subtask(&conn, l1.id, "移动端适配").unwrap();
+        insert_subtask(&conn, l2.id, "窄屏走查").unwrap();
+
+        let copy = duplicate_task_inner(&conn, l1.id, None).expect("复制");
+        let all = subtask_rows(&conn).unwrap();
+        let mine: Vec<&Task> = all.iter().filter(|s| s.parent_id == Some(copy.id)).collect();
+        assert_eq!(mine.len(), 1, "第二层要在");
+        let grand: Vec<&Task> =
+            all.iter().filter(|s| s.parent_id == Some(mine[0].id)).collect();
+        assert_eq!(grand.len(), 1, "第三层也要跟着过来，否则复制出来的是棵断树");
+    }
+
+    #[test]
+    fn duplicating_without_a_base_keeps_the_original_dates() {
+        let conn = db();
+        let parent = stage(&conn);
+        set_span(&conn, parent.id, Some("2026-10-01T09:00:00+08:00"), None);
+
+        let copy = duplicate_task_inner(&conn, parent.id, None).expect("复制");
+        // 取回最新的一条再比：parent 是设日期之前拿的快照，此时它的 due_at 还是空的
+        let fresh = fetch_task(&conn, parent.id).unwrap();
+        assert_eq!(copy.due_at, fresh.due_at, "没给基准日就原地复制，日期不动");
+    }
+
+    #[test]
+    fn duplicating_a_recurring_task_does_not_copy_a_stale_date() {
+        let conn = db();
+        let task = recurring(&conn, "2020-01-03T17:00:00+08:00");   // 一个早就过去的周五
+
+        let copy = duplicate_task_inner(&conn, task.id, None).expect("复制");
+        let due = parse_dt(copy.due_at.as_deref().unwrap()).unwrap();
+        assert!(
+            due > Local.with_ymd_and_hms(2020, 6, 1, 0, 0, 0).unwrap(),
+            "周期任务照搬旧时间的话，复制出来一出生就是逾期的：{due}"
+        );
+    }
+
+    /* ---------------- 模板 ---------------- */
+
+    #[test]
+    fn a_template_stores_offsets_not_absolute_dates() {
+        let conn = db();
+        let parent = stage(&conn);
+        set_span(&conn, parent.id, Some("2026-10-01T09:00:00+08:00"), Some("2026-10-05T23:59:00+08:00"));
+        let sub = insert_subtask(&conn, parent.id, "第一步").unwrap();
+        set_span(&conn, sub.id, Some("2026-10-02T18:00:00+08:00"), None);
+
+        let tpl = template_from_task(&conn, parent.id, "季度复盘").expect("存模板");
+        assert_eq!(tpl.items.len(), 2);
+        assert_eq!(tpl.name, "季度复盘");
+
+        let root = tpl.items.iter().find(|i| i.parent_id.is_none()).unwrap();
+        assert_eq!(root.due_offset, Some(0), "根任务的开始日就是基准日");
+        assert_eq!(root.end_offset, Some(4));
+        assert_eq!(root.due_time.as_deref(), Some("09:00"), "时分要单独存，光留天数不够");
+        assert_eq!(root.pattern, "stage");
+
+        let kid = tpl.items.iter().find(|i| i.parent_id.is_some()).unwrap();
+        assert_eq!(kid.due_offset, Some(1), "第二步相对基准日是第 1 天");
+        assert_eq!(kid.due_time.as_deref(), Some("18:00"), "第二层的时间也要留住");
+
+        // 库里绝不能出现绝对日期：存了「10 月 8 日截止」，下个月调用就过期了
+        let mut stmt = conn.prepare("PRAGMA table_info(template_items)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !cols.iter().any(|c| c == "due_at" || c == "end_at"),
+            "模板表里不该有绝对日期字段：{cols:?}"
+        );
+    }
+
+    #[test]
+    fn applying_a_template_lays_the_tree_onto_the_base_date() {
+        let conn = db();
+        let parent = stage(&conn);
+        set_span(&conn, parent.id, Some("2026-10-01T09:00:00+08:00"), None);
+        let sub = insert_subtask(&conn, parent.id, "第一步").unwrap();
+        set_span(&conn, sub.id, Some("2026-10-03T15:00:00+08:00"), None);
+        let l3 = insert_subtask(&conn, sub.id, "再分一小步").unwrap();
+        set_span(&conn, l3.id, None, None);
+
+        let tpl = template_from_task(&conn, parent.id, "季度复盘").unwrap();
+        // 原件清干净，只留模板——这样测的才是模板本身
+        conn.execute("DELETE FROM tasks", []).unwrap();
+
+        let top = apply_template_inner(&conn, tpl.id, "2026-12-01").expect("应用模板");
+        assert_eq!(top, 1, "模板里只有 1 件顶层工作");
+
+        let all = subtask_rows(&conn).unwrap();
+        assert_eq!(all.len(), 2, "两层步骤都要建出来");
+
+        let root = &top_level_tasks(&conn).unwrap()[0];
+        let due = parse_dt(root.due_at.as_deref().unwrap()).unwrap();
+        assert_eq!(due.date_naive(), NaiveDate::from_ymd_opt(2026, 12, 1).unwrap());
+        assert_eq!(due.time().to_string(), "09:00:00", "时分从模板里还原");
+
+        let step2 = all.iter().find(|s| s.title == "第一步").unwrap();
+        let d2 = parse_dt(step2.due_at.as_deref().unwrap()).unwrap();
+        assert_eq!(d2.date_naive(), NaiveDate::from_ymd_opt(2026, 12, 3).unwrap(), "第 2 天");
+        assert_eq!(d2.time().to_string(), "15:00:00");
+
+        let deep = all.iter().find(|s| s.title == "再分一小步").unwrap();
+        assert!(deep.due_at.is_none(), "模板里没有日期的步骤，建出来也不该凭空多一个日期");
+        assert_eq!(deep.parent_id, Some(step2.id), "第三层要挂在第二层下面");
+    }
+
+    #[test]
+    fn a_template_keeps_working_after_its_category_is_deleted() {
+        let conn = db();
+        let parent = stage(&conn);   // 挂在分类 1 上
+        let tpl = template_from_task(&conn, parent.id, "带分类的模板").unwrap();
+        conn.execute("DELETE FROM categories WHERE id = 1", []).unwrap();
+
+        let top = apply_template_inner(&conn, tpl.id, "2026-12-01").expect("分类没了也要能建");
+        assert_eq!(top, 1);
+        assert_eq!(
+            top_level_tasks(&conn).unwrap()[0].category_id,
+            None,
+            "分类没了就落到「未分类」，不能为这个拦下整批"
+        );
+    }
+
+    #[test]
+    fn a_template_needs_a_name_and_some_content() {
+        let conn = db();
+        let parent = stage(&conn);
+        assert!(template_from_task(&conn, parent.id, "   ").is_err());
+        assert_eq!(all_templates(&conn).unwrap().len(), 0, "没名字的模板不该留下");
+
+        // 空模板（删掉条目后）应用时要给出说得清的话，而不是默默建出零条
+        let tpl = template_from_task(&conn, parent.id, "空壳").unwrap();
+        conn.execute("DELETE FROM template_items WHERE template_id = ?1", params![tpl.id])
+            .unwrap();
+        assert!(apply_template_inner(&conn, tpl.id, "2026-12-01").is_err());
+    }
+
+    #[test]
+    fn deleting_a_template_leaves_its_tasks_alone() {
+        let conn = db();
+        let parent = stage(&conn);
+        let tpl = template_from_task(&conn, parent.id, "随手存的").unwrap();
+        apply_template_inner(&conn, tpl.id, "2026-12-01").unwrap();
+
+        let before = top_level_tasks(&conn).unwrap().len();
+        conn.execute("DELETE FROM templates WHERE id = ?1", params![tpl.id]).unwrap();
+
+        assert_eq!(top_level_tasks(&conn).unwrap().len(), before, "删模板不能连累已建出来的工作");
+        assert_eq!(all_templates(&conn).unwrap().len(), 0);
+        // 条目靠外键级联清掉，不留垃圾
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM template_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "模板删了，它的条目也该跟着走");
+    }
+
     /* ---- 备份 / 恢复 ---- */
 
     /// 每个测试用独立的临时目录，避免并行跑的时候互相踩
@@ -1053,6 +1746,83 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(titles, vec!["甲", "乙"], "连内容都得对上，不能只剩个数量");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 备份要把模板一起带走。
+    /// 模板表是后加的，容易在「备份搬哪几张表」这类清单里被漏掉，
+    /// 漏掉的后果是用户恢复完发现模板全没了——而且当时不会报任何错。
+    #[test]
+    fn a_backup_carries_templates_too() {
+        let dir = tmp_dir("tpl");
+        let bak = dir.join("bak.db");
+
+        let mut live = db();
+        let p = stage(&live);
+        insert_subtask(&live, p.id, "第一步").unwrap();
+        template_from_task(&live, p.id, "季度复盘").unwrap();
+        write_backup(&live, &bak).expect("导出");
+
+        live.execute("DELETE FROM templates", []).unwrap();
+        assert_eq!(count(&live, "templates"), 0);
+
+        read_backup(&mut live, &bak).expect("恢复");
+
+        assert_eq!(count(&live, "templates"), 1, "模板要跟着备份回来");
+        assert_eq!(count(&live, "template_items"), 2, "模板里的条目也要回来");
+        let t = all_templates(&live).unwrap();
+        assert_eq!(t[0].name, "季度复盘");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 老版本建的备份里没有模板表，不能因此就把整个备份拒掉——
+    /// 用户可能只有那一份备份。这种情况按「跳过模板」处理。
+    #[test]
+    fn restoring_an_old_backup_without_template_tables_still_works() {
+        let dir = tmp_dir("old");
+        let old = dir.join("old.db");
+
+        // 手工造一个 1.0.x 时期的备份：四张表，没有模板表
+        {
+            let c = Connection::open(&old).expect("建老备份");
+            c.execute_batch(
+                "CREATE TABLE categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                                          color TEXT NOT NULL DEFAULT '#000',
+                                          sort INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+                                     note TEXT NOT NULL DEFAULT '', category_id INTEGER,
+                                     pattern TEXT NOT NULL DEFAULT 'once',
+                                     status TEXT NOT NULL DEFAULT 'todo',
+                                     due_at TEXT, end_at TEXT, remind_at TEXT, rule TEXT,
+                                     progress TEXT, parent_id INTEGER,
+                                     sort INTEGER NOT NULL DEFAULT 0,
+                                     created_at TEXT, completed_at TEXT, notified_at TEXT);
+                 CREATE TABLE completions (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER,
+                                           title TEXT NOT NULL, category_id INTEGER,
+                                           pattern TEXT NOT NULL DEFAULT 'recurring',
+                                           due_at TEXT, done_at TEXT NOT NULL);
+                 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO categories (name, color, sort) VALUES ('老分类', '#123456', 0);
+                 INSERT INTO tasks (title, note, pattern, status, sort)
+                       VALUES ('老任务', '', 'once', 'todo', 0);",
+            )
+            .expect("建老备份的表");
+        }
+
+        let mut live = db();
+        let p = stage(&live);
+        template_from_task(&live, p.id, "恢复前就有的模板").unwrap();
+
+        read_backup(&mut live, &old).expect("老备份必须能恢复");
+
+        assert_eq!(count(&live, "tasks"), 1, "老备份里的工作要进来");
+        assert_eq!(
+            all_templates(&live).unwrap().len(),
+            1,
+            "老备份里没有模板信息，就不该动现有的模板"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

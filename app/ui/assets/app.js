@@ -1,4 +1,13 @@
-/* 工作记录本 — 前端逻辑 */
+/* 工作记录本 (WorkLuLu) — 前端逻辑 */
+
+/** 软件身份。界面上凡是出现名字、版本、版权的地方都从这里取，
+ *  免得改一处漏一处。
+ *  版本号以打包进 exe 的包信息为准（后端 app_version 命令），
+ *  这里的 FALLBACK 只在浏览器预览模式（没有后端）下兜底。 */
+const APP_NAME_CN = '工作记录本';
+const APP_NAME_EN = 'WorkLuLu';
+const APP_VERSION_FALLBACK = '1.2.0';
+const APP_COPYRIGHT = '© 2026 JJAI 制作';
 
 const PATTERNS = {
   once:      { label: '一次性', bar: 'p-once',      chip: 'chip-once',      color: '#F59E0B' },
@@ -137,15 +146,23 @@ const state = {
   calMonth: null,    // 日历正翻到哪个月（该月 1 号）；null = 跟着今天走
   categories: [],
   tasks: [],
-  subtasks: [],      // 阶段性工作拆出来的步骤，不进主列表
+  subtasks: [],      // 阶段性工作拆出来的步骤（含子任务的子任务），不进主列表
   completions: [],   // 周期任务的完成记录
+  templates: [],     // 模板库：把一套反复要用的结构存下来，下次一键重建
   settings: {},
   dataPath: '',
+  appVersion: APP_VERSION_FALLBACK,
   q: '',
   drawerId: null,
   drawerRendered: null,  // 抽屉此刻渲染的是哪个任务：切走前要先收下没保存的输入
   editing: null,
   catEditing: null,
+  dayView: null,     // 「这一天还有 N 项」弹窗正看着哪一天（YYYY-MM-DD）
+  subAddFor: null,   // 正在给哪个子任务加下级：那一行会展开一个输入框
+  ctxMenu: null,     // 日历上右键弹出的菜单：{ date, x, y }
+  tplApplying: null, // 「从模板新建」正挑哪一天：{ id, name, items, base }
+  tplSaving: null,   // 「存为模板」正起名字：{ taskId, name, steps }
+  reward: false,     // 赞赏码弹窗开着没有
 };
 
 /* ---------------- API 层（Tauri / 浏览器预览双通道） ---------------- */
@@ -301,13 +318,47 @@ function mockData() {
       { id: 13, title: '季度复盘会材料', categoryId: 1, pattern: 'recurring', status: 'todo',
         rule: { freq: 'quarterly', byDay: [25], byMonth: [3], time: '15:00' }, dueAt: at(9, 15) },
     ],
-    // 阶段性工作拆出来的步骤。父任务那条的进度就由它们算
+    // 阶段性工作拆出来的步骤，父任务那条的进度就由它们算。
+    // 104 下面还有一层：拆解最深支持三层（工作 → 子任务 → 子子任务）
     subtasks: [
-      { id: 101, parentId: 2, title: '首页终稿',           status: 'done', pattern: 'once', note: '' },
-      { id: 102, parentId: 2, title: '产品页终稿',         status: 'done', pattern: 'once', note: '' },
-      { id: 103, parentId: 2, title: '关于页终稿',         status: 'done', pattern: 'once', note: '' },
-      { id: 104, parentId: 2, title: '移动端适配',         status: 'todo', pattern: 'once', note: '' },
-      { id: 105, parentId: 2, title: '交付设计稿源文件',   status: 'todo', pattern: 'once', note: '' },
+      { id: 101, parentId: 2, title: '首页终稿',             status: 'done', pattern: 'once', note: '' },
+      { id: 102, parentId: 2, title: '产品页终稿',           status: 'done', pattern: 'once', note: '' },
+      { id: 103, parentId: 2, title: '关于页终稿',           status: 'done', pattern: 'once', note: '' },
+      { id: 104, parentId: 2, title: '移动端适配',           status: 'todo', pattern: 'once', note: '' },
+      { id: 106, parentId: 104, title: '窄屏（< 900px）走查', status: 'done', pattern: 'once', note: '' },
+      { id: 107, parentId: 104, title: '触屏点击区放大',      status: 'todo', pattern: 'once', note: '' },
+      { id: 105, parentId: 2, title: '交付设计稿源文件',     status: 'todo', pattern: 'once', note: '' },
+    ],
+    // 模板库示例。日期全是「相对基准日的天数」，不是具体日期——
+    // 存「10 月 8 日截止」的话，下个月调用就过期了
+    templates: [
+      {
+        id: 1, name: '季度复盘流程', note: '', createdAt: at(-20, 10),
+        items: [
+          { id: 1, parentId: null, title: '整理季度复盘材料', note: '', categoryId: 1, pattern: 'stage',
+            rule: null, dueOffset: 0, endOffset: 4, dueTime: '09:00', endTime: '23:59', sort: 0 },
+          { id: 2, parentId: 1, title: '对齐各条线数据', note: '', categoryId: 1, pattern: 'once',
+            rule: null, dueOffset: 0, endOffset: 1, dueTime: '18:00', endTime: '23:59', sort: 1 },
+          { id: 3, parentId: 2, title: '找财务要流水', note: '', categoryId: 1, pattern: 'once',
+            rule: null, dueOffset: 0, endOffset: 0, dueTime: '12:00', endTime: '23:59', sort: 2 },
+          { id: 4, parentId: 2, title: '找运营要转化数据', note: '', categoryId: 1, pattern: 'once',
+            rule: null, dueOffset: 1, endOffset: 1, dueTime: '12:00', endTime: '23:59', sort: 3 },
+          { id: 5, parentId: 1, title: '出结论页', note: '', categoryId: 1, pattern: 'once',
+            rule: null, dueOffset: 3, endOffset: 4, dueTime: '18:00', endTime: '23:59', sort: 4 },
+        ],
+      },
+      {
+        id: 2, name: '每月费用对账', note: '', createdAt: at(-40, 10),
+        items: [
+          { id: 6, parentId: null, title: '月度费用对账', note: '', categoryId: 2, pattern: 'recurring',
+            rule: { freq: 'monthly', byDay: [1], time: '10:00' },
+            dueOffset: null, endOffset: null, dueTime: null, endTime: null, sort: 0 },
+          { id: 7, parentId: 6, title: '导出上月全部流水', note: '', categoryId: 2, pattern: 'once',
+            rule: null, dueOffset: 0, endOffset: 0, dueTime: '18:00', endTime: '23:59', sort: 1 },
+          { id: 8, parentId: 6, title: '逐笔核对并标注差异', note: '', categoryId: 2, pattern: 'once',
+            rule: null, dueOffset: 1, endOffset: 1, dueTime: '18:00', endTime: '23:59', sort: 2 },
+        ],
+      },
     ],
     // 半年的周期完成记录，让热力图和趋势图在预览里有东西可看
     completions: (() => {
@@ -345,9 +396,12 @@ function mockData() {
 async function loadAll() {
   if (hasTauri) {
     try {
-      const [categories, tasks, settings, dataPath, completions, subtasks] = await Promise.all([
+      const [categories, tasks, settings, dataPath, completions, subtasks, templates, version] = await Promise.all([
         inv('list_categories'), inv('list_tasks'), inv('get_settings'),
         inv('data_dir'), inv('list_completions', { limit: 1000 }), inv('list_subtasks'),
+        inv('list_templates'),
+        // 版本号只影响「关于」那几行字，读不到也不该把整次加载带崩
+        inv('app_version').catch(() => APP_VERSION_FALLBACK),
       ]);
       state.categories = categories;
       state.tasks = tasks;
@@ -355,6 +409,8 @@ async function loadAll() {
       state.dataPath = dataPath;
       state.completions = completions || [];
       state.subtasks = subtasks || [];
+      state.templates = templates || [];
+      state.appVersion = version || APP_VERSION_FALLBACK;
       applySubtaskProgress();
       return;
     } catch (e) { console.warn('后端调用失败，启用预览数据', e); }
@@ -364,19 +420,47 @@ async function loadAll() {
   state.tasks = m.tasks;
   state.completions = m.completions;
   state.subtasks = m.subtasks || [];
+  state.templates = m.templates || [];
   state.settings = {};
   state.dataPath = 'C:\\Users\\<你>\\AppData\\Roaming\\工作记录本';
+  state.appVersion = APP_VERSION_FALLBACK;
   applySubtaskProgress();
 }
 
+/** 直接挂在这一层下面的步骤 */
 const subtasksOf = parentId => state.subtasks.filter(s => s.parentId === parentId);
+
+/** 这件工作下面拆出来的**全部**步骤，含子任务的子任务（深度优先展平）。
+ *
+ *  进度按全部步骤算，不是只算直接子任务 —— 否则「A 底下还分了三小步」时，
+ *  A 这一层勾没勾就成了唯一计分项，下面干到哪了一步全被吞掉。 */
+function descendantsOf(id) {
+  const out = [];
+  const walk = pid => subtasksOf(pid).forEach(s => { out.push(s); walk(s.id); });
+  walk(id);
+  return out;
+}
+
+/** 拆解层数上限。顶层工作算第 1 层，与后端 MAX_DEPTH 同一口径。 */
+const MAX_DEPTH = 3;
+
+/** 某个子任务在第几层（顶层工作算 1 层） */
+function depthOf(id) {
+  let d = 1;
+  let cur = state.subtasks.find(s => s.id === id);
+  while (cur && d < 64) { d++; cur = state.subtasks.find(s => s.id === cur.parentId); }
+  return d;
+}
+
+/** 还能不能再往下拆：超过上限的那一层，界面上直接不给「+」入口 */
+const canNest = id => depthOf(id) < MAX_DEPTH;
 
 /** 阶段性工作的进度由子任务算出来，不给人手填的机会——少一个能填错的地方。
  *  没有子任务时就是 0/0，界面显示「未拆解」。 */
 function applySubtaskProgress() {
   state.tasks.forEach(t => {
     if (t.pattern !== 'stage') return;
-    const kids = subtasksOf(t.id);
+    const kids = descendantsOf(t.id);
     t.progress = { done: kids.filter(s => s.status === 'done').length, total: kids.length };
   });
 }
@@ -523,6 +607,7 @@ function renderSidebar() {
     <div class="nav-group">${state.categories.map(catItem).join('')}${uncatItem}</div>
     <div class="sidebar-foot">
       <div class="nav-sep"></div>
+      ${navItem('tpl', '模板', '#0EA5E9', state.templates.length || '')}
       ${navItem('stats', '统计看板', '#8B5CF6', '')}
       ${navItem('settings', '设置', '#94A3B8', '')}
     </div>`;
@@ -842,21 +927,42 @@ function renderBoard() {
 
 /* ---------------- 日历：把截止日铺到月历上 ---------------- */
 
+/** 某一天在日历上要显示的条目，按「交期优先」排好。
+ *
+ *  交期那天的条目 kind 为 'due'；阶段性工作的跨度内其余各天给一条 'span'。
+ *  只标交期的话，一个跨三周的大任务在日历上只出现一格，
+ *  中间这段时间在忙什么、有多忙，完全看不出来。
+ *
+ *  `pool` 是已经按当前视图筛过的工作集合；不传就自己算一次。 */
+function entriesOn(dateStr, pool) {
+  if (!dateStr) return [];
+  const key = startOfDay(new Date(`${dateStr}T00:00:00`)).getTime();
+  const out = [];
+  (pool || scopeTasks()).forEach(t => {
+    const dl = deadlineOf(t);
+    if (!dl) return;
+    const to = startOfDay(new Date(dl)).getTime();
+    if (to === key) { out.push({ t, kind: 'due' }); return; }
+    if (t.pattern !== 'stage' || !t.dueAt || !t.endAt) return;
+    const from = startOfDay(new Date(t.dueAt)).getTime();
+    // 跨度超过一年多半是数据有问题，别让循环跑飞
+    if ((to - from) / DAY > 400) return;
+    if (key >= from && key < to) out.push({ t, kind: 'span' });
+  });
+  // 交期排在跨度条前面——同一天里那是重点，也是格子里优先露出来的那几条
+  return out.sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === 'due' ? -1 : 1;
+    return a.t.id - b.t.id;
+  });
+}
+
 function renderCalendar() {
   const base = state.calMonth || new Date();
   const y = base.getFullYear();
   const m = base.getMonth();
   const first = new Date(y, m, 1);
 
-  // 按天归堆。只认截止日——一件工作占一个格子，跨天的阶段性工作落在交期那天
-  const byDay = new Map();
-  scopeTasks().forEach(t => {
-    const dl = deadlineOf(t);
-    if (!dl) return;
-    const k = startOfDay(new Date(dl)).getTime();
-    if (!byDay.has(k)) byDay.set(k, []);
-    byDay.get(k).push(t);
-  });
+  const pool = scopeTasks();
 
   // 周一起头：起点回退到 1 号所在周的周一
   const gridStart = startOfWeek(first);
@@ -870,25 +976,29 @@ function renderCalendar() {
     const d = new Date(gridStart);
     d.setDate(d.getDate() + i);
     const k = d.getTime();
-    const items = sortTasks(byDay.get(k) || []);
-    const shown = items.slice(0, 3);
-    const more = items.length - shown.length;
+    const entries = entriesOn(toLocalDate(d), pool);
+    const shown = entries.slice(0, 3);
+    const more = entries.length - shown.length;
 
     grid += `
-      <div class="cal-cell ${d.getMonth() !== m ? 'is-out' : ''} ${k === todayKey ? 'is-today' : ''}">
+      <div class="cal-cell ${d.getMonth() !== m ? 'is-out' : ''} ${k === todayKey ? 'is-today' : ''}"
+           data-act="cal-new" data-date="${toLocalDate(d)}" title="在这一天新建工作">
         <div class="cal-date">${d.getDate()}</div>
         <div class="cal-items">
-          ${shown.map(t => {
+          ${shown.map(({ t, kind }) => {
             const cat = catById(t.categoryId);
             // 标题单独包一层：flex 容器上直接写 text-overflow 不管用，
             // 文本会被当成匿名 flex 项，省不掉省略号
-            return `<div class="cal-item ${t.status === 'done' ? 'is-done' : ''}"
-                         data-act="open" data-id="${t.id}" title="${escAttr(t.title)}">
+            return `<div class="cal-item ${kind === 'span' ? 'is-span' : ''} ${t.status === 'done' ? 'is-done' : ''}"
+                         data-act="open" data-id="${t.id}"
+                         title="${escAttr(t.title)}${kind === 'span' ? '（进行中）' : ''}">
               <span class="cal-dot" style="background:${cat ? cat.color : '#CBD5E1'}"></span>
               <span class="cal-text">${esc(t.title)}</span>
             </div>`;
           }).join('')}
-          ${more > 0 ? `<div class="cal-more">还有 ${more} 项</div>` : ''}
+          ${more > 0
+            ? `<div class="cal-more" data-act="cal-day" data-date="${toLocalDate(d)}">还有 ${more} 项</div>`
+            : ''}
         </div>
       </div>`;
   }
@@ -899,7 +1009,7 @@ function renderCalendar() {
   return `
     <div class="view-head">
       <div class="view-title">日历</div>
-      <div class="view-sub">按截止日铺开，点一条可以打开详情</div>
+      <div class="view-sub">按截止日铺开。点一条看详情，点空白处在那天新建，滚轮翻月</div>
     </div>
     <div class="cal-bar">
       <button class="icon-btn" data-act="cal-prev" title="上个月">
@@ -915,6 +1025,57 @@ function renderCalendar() {
       ${['一', '二', '三', '四', '五', '六', '日'].map(w => `<div class="cal-weekday">${w}</div>`).join('')}
     </div>
     <div class="cal-grid">${grid}</div>`;
+}
+
+/* ---------------- 模板库：把一套结构存下来，下次一键重建 ---------------- */
+
+function renderTemplates() {
+  const list = state.templates || [];
+
+  const cards = list.map(t => {
+    const top = t.items.filter(i => i.parentId == null).length;
+    const offs = t.items.map(i => i.dueOffset).filter(v => v != null);
+    const span = offs.length ? `跨度 ${Math.min(0, ...offs)} – ${Math.max(0, ...offs)} 天` : '';
+    // 最深到第几层：模板里存的下级关系看不出深浅，得算一遍才说得清
+    const byId = new Map(t.items.map(i => [i.id, i]));
+    const depth = t.items.reduce((mx, i) => {
+      let d = 1, cur = i;
+      while (cur && cur.parentId != null && d < 64) { d++; cur = byId.get(cur.parentId); }
+      return Math.max(mx, d);
+    }, 0);
+
+    const meta = [
+      `${top} 件工作`,
+      depth > 1 ? `${depth} 层结构` : '',
+      `${t.items.length} 个条目`,
+      span,
+    ].filter(Boolean).join(' · ');
+
+    return `
+      <div class="tpl-card">
+        <div class="tpl-main">
+          <div class="tpl-name">${esc(t.name)}</div>
+          <div class="tpl-meta">${esc(meta)}</div>
+        </div>
+        <div class="tpl-actions">
+          <button class="btn btn-primary" data-act="tpl-apply" data-id="${t.id}">新建一批</button>
+          <button class="btn btn-danger-ghost" data-act="tpl-del" data-id="${t.id}">删除</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="view-head">
+      <div class="view-title">模板</div>
+      <div class="view-sub">${list.length
+        ? `${list.length} 个模板 · 里面存的是相对天数，挑哪天调用就从哪天铺开，不会过期`
+        : '把反复要做的一整套结构存下来，下次一键重建'}</div>
+    </div>
+    ${list.length ? `<div class="tpl-list">${cards}</div>` : `
+      <div class="empty">
+        还没有模板。<br>
+        打开任意一条工作的详情，点「存为模板」，就能把它连同下面的步骤一起存下来。
+      </div>`}`;
 }
 
 /* ---------------- 统计看板 ---------------- */
@@ -1215,15 +1376,31 @@ function renderStats() {
 }
 
 const SETTING_ITEMS = [
-  { key: 'autostart', title: '开机自动启动', desc: '登录 Windows 后在托盘静默启动' },
+  { key: 'autostart', title: '开机自动启动', desc: '登录 Windows 后在托盘静默启动。默认不开，需要它常驻后台时再打开' },
   { key: 'notify',    title: '到期提醒',     desc: '任务到期时弹出系统通知' },
   { key: 'tray',      title: '关闭窗口时最小化到托盘', desc: '关闭后继续在后台运行，保证提醒准时' },
 ];
 
+/** 默认是「关」的开关。
+ *  用户没动过设置时，其余开关默认开（它们只是程序内部的行为）；
+ *  唯独开机自启必须默认关 —— 它要往系统里写启动项，
+ *  不该在用户没明确同意的情况下替他做这个决定。
+ *  这也是杀软行为引擎最敏感的动作之一，少写一次就少一分被误报的理由。 */
+const DEFAULT_OFF = { autostart: true };
+
 function settingOn(key) {
   const v = state.settings?.[key];
-  if (v === undefined || v === null || v === '') return true;   // 未设置时默认开启
+  if (v === undefined || v === null || v === '') return !DEFAULT_OFF[key];
   return v === '1' || v === 'true' || v === 'on' || v === true;
+}
+
+/** 开关之间的连带关系当场讲清楚。
+ *  提醒是程序自己在后台轮询发出来的 —— 程序不跑就没有提醒。
+ *  用户关掉开机自启后，很自然会以为「提醒还开着 = 到点会响」，这里得拦住这个误会。 */
+function settingHint(s) {
+  const needsBackground = s.key === 'notify' && settingOn('notify') && !settingOn('autostart');
+  if (!needsBackground) return '';
+  return `<div class="task-meta warn-text">提醒要靠程序在后台跑着才发得出来。没开开机自启，重启电脑后就收不到提醒了。</div>`;
 }
 
 function renderSettings() {
@@ -1239,6 +1416,7 @@ function renderSettings() {
           <div class="task-main">
             <div class="task-title">${s.title}</div>
             <div class="task-meta">${s.desc}</div>
+            ${settingHint(s)}
           </div>
           <button class="switch ${on(s.key) ? 'on' : ''}" data-act="toggle-setting" data-key="${s.key}" aria-label="${s.title}"><i></i></button>
         </div>`).join('')}
@@ -1276,16 +1454,34 @@ function renderSettings() {
         </div>
         <button class="btn btn-ghost" data-act="open-data-dir">打开目录</button>
       </div>
+    </div>
+
+    <div class="section-head" style="margin-top:22px">
+      <span class="section-title">关于</span><span class="section-line"></span>
+    </div>
+    <div class="task-list">
+      <div class="task" style="padding:14px">
+        <div class="task-main">
+          <div class="task-title">
+            ${APP_NAME_CN}<span class="name-en" style="margin-left:7px">${APP_NAME_EN}</span>
+          </div>
+          <div class="task-meta">版本 ${esc(state.appVersion || APP_VERSION_FALLBACK)} · 单文件绿色版，拷到哪儿都能跑</div>
+          <div class="task-meta">${APP_COPYRIGHT}</div>
+        </div>
+        <button class="btn btn-ghost" data-act="open-reward">赞赏…</button>
+      </div>
     </div>`;
 }
 
 function renderView() {
   const v = state.view;
-  const plain = v === 'stats' || v === 'settings';   // 这两屏没有排布方式可选
+  // 这几屏没有「列表 / 看板 / 日历」可选，不挂右上角的开关
+  const plain = v === 'stats' || v === 'settings' || v === 'tpl';
   let html;
 
   if (v === 'stats')                 html = renderStats();
   else if (v === 'settings')         html = renderSettings();
+  else if (v === 'tpl')              html = renderTemplates();
   else if (state.mode === 'board')   html = renderBoard();
   else if (state.mode === 'calendar')html = renderCalendar();
   else if (v === 'today')            html = renderToday();
@@ -1322,31 +1518,51 @@ function flushDrawerDom() {
   if (endEl) t.endAt = endEl.value ? new Date(`${endEl.value}T23:59:00`).toISOString() : null;
 }
 
-/** 阶段性工作的子任务清单：勾选、就地改名、删除、随手追加 */
+/** 子任务行，连带它自己的下级一起画。缩进按层级递增，深层用一条竖线连回父级。
+ *  层数封顶 MAX_DEPTH，所以这个递归一定会停——不需要额外护栏。 */
+function subtaskNode(s, depth) {
+  const kids = subtasksOf(s.id);
+  const done = kids.filter(k => k.status === 'done').length;
+  return `
+    <div class="sub-node" data-depth="${depth}">
+      <div class="sub-item ${s.status === 'done' ? 'is-done' : ''}">
+        <button class="sub-check" data-act="sub-toggle" data-id="${s.id}" aria-label="完成这一步">
+          <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 5.2l2.2 2.2 4.8-4.8"/></svg>
+        </button>
+        <input class="sub-title" data-sub-title="${s.id}" value="${escAttr(s.title)}" title="点一下就能改">
+        ${kids.length ? `<span class="sub-ratio" title="下级完成情况">${done}/${kids.length}</span>` : ''}
+        ${canNest(s.id) ? `
+          <button class="icon-btn sm sub-nest" data-act="sub-add-for" data-id="${s.id}" title="给这一步再分小步">
+            <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M7 3v8M3 7h8"/></svg>
+          </button>` : ''}
+        <button class="icon-btn sm sub-del" data-act="sub-del" data-id="${s.id}" title="删除这一步">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
+        </button>
+      </div>
+      ${state.subAddFor === s.id ? `
+        <div class="sub-add sub-add-inline">
+          <input class="field-input" id="d-sub-input-inline" placeholder="给这一步再分一小步，回车确定">
+          <button class="btn btn-ghost" data-act="add-subtask" data-parent="${s.id}">添加</button>
+        </div>` : ''}
+      ${kids.map(k => subtaskNode(k, depth + 1)).join('')}
+    </div>`;
+}
+
+/** 阶段性工作的子任务清单：勾选、就地改名、删除、随手追加，还能给「一步」再分小步 */
 function subtaskEditor(t) {
-  const kids = subtasksOf(t.id);
-  const done = kids.filter(s => s.status === 'done').length;
+  const all = descendantsOf(t.id);
+  const done = all.filter(s => s.status === 'done').length;
   return `
     <div class="field">
-      <div class="field-label">子任务<span class="sub-progress">${done} / ${kids.length}</span></div>
-      ${kids.length ? `
-        <div class="sub-list">
-          ${kids.map(s => `
-            <div class="sub-item ${s.status === 'done' ? 'is-done' : ''}">
-              <button class="sub-check" data-act="sub-toggle" data-id="${s.id}" aria-label="完成这一步">
-                <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 5.2l2.2 2.2 4.8-4.8"/></svg>
-              </button>
-              <input class="sub-title" data-sub-title="${s.id}" value="${escAttr(s.title)}" title="点一下就能改">
-              <button class="icon-btn sm sub-del" data-act="sub-del" data-id="${s.id}" title="删除这一步">
-                <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
-              </button>
-            </div>`).join('')}
-        </div>` : '<div class="hint">还没拆步骤。把这件事分成几步，进度就是自动算的。</div>'}
+      <div class="field-label">子任务<span class="sub-progress">${done} / ${all.length}</span></div>
+      ${all.length
+        ? `<div class="sub-list">${subtasksOf(t.id).map(s => subtaskNode(s, 1)).join('')}</div>`
+        : '<div class="hint">还没拆步骤。把这件事分成几步，进度就是自动算的。</div>'}
       <div class="sub-add">
         <input class="field-input" id="d-sub-input" placeholder="加一步，回车确定">
         <button class="btn btn-ghost" data-act="add-subtask">添加</button>
       </div>
-      ${kids.length && done === kids.length
+      ${all.length && done === all.length
         ? '<div class="hint">子任务都完成了，可以给这件工作收尾</div>' : ''}
     </div>`;
 }
@@ -1364,12 +1580,18 @@ function renderDrawer() {
   el.innerHTML = `
     <div class="drawer-head">
       <span class="drawer-title">工作详情</span>
-      <button class="icon-btn" data-act="edit">
+      <button class="icon-btn" data-act="edit" title="编辑">
         <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M9.3 2.1l2.6 2.6M2 12l.7-2.9 6.6-6.6 2.6 2.6-6.6 6.6L2 12z"/>
         </svg>
       </button>
-      <button class="icon-btn" data-act="close-drawer">
+      <button class="icon-btn" data-act="duplicate" title="复制一份（连步骤一起）">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4.8" y="4.8" width="7.7" height="7.7" rx="1.4"/>
+          <path d="M9.2 1.5H3.1a1.6 1.6 0 0 0-1.6 1.6v6.1"/>
+        </svg>
+      </button>
+      <button class="icon-btn" data-act="close-drawer" title="关闭">
         <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
       </button>
     </div>
@@ -1440,6 +1662,16 @@ function renderDrawer() {
         <div class="hint">备注会显示在列表里，最多两行</div>
       </div>
       ${t.pattern === 'stage' ? subtaskEditor(t) : ''}
+      <div class="field">
+        <div class="field-label">复用</div>
+        <div class="row-between">
+          <div class="hint">${(() => {
+            const n = descendantsOf(t.id).length;
+            return n ? `连同 ${n} 个步骤一起存成模板，下次一键重建` : '存成模板，下次一键重建';
+          })()}</div>
+          <button class="btn btn-ghost" data-act="save-as-template">存为模板</button>
+        </div>
+      </div>
       <div class="field">
         <div class="field-label">创建时间</div>
         <div class="hint">${t.createdAt ? new Date(t.createdAt).toLocaleString('zh-CN') : '—'}</div>
@@ -1546,6 +1778,124 @@ function renderModal() {
     return;
   }
 
+  // 下面三个是辅助小面板（存模板 / 从模板建 / 按日查看），
+  // 它们各自只有一个输入框，光标还原交给 restoreModalFocus 就够了
+  if (state.tplSaving) {
+    const s = state.tplSaving;
+    modal.innerHTML = `
+      <div class="modal-head">
+        <h2>存为模板</h2>
+        <button class="icon-btn" data-act="close-aux-modal">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <div class="field-label">模板名称</div>
+          <input class="field-input" id="t-name" value="${escAttr(s.name)}" placeholder="例如：月度复盘流程">
+        </div>
+        <div class="field">
+          <div class="field-label">会存下什么</div>
+          <div class="hint">${s.steps ? `这条工作本身，加上它下面的 ${s.steps} 个步骤。` : '这条工作本身。'}
+            存的是「第几天做什么」而不是具体日期，所以哪个月调用都不过期。</div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" data-act="close-aux-modal">取消</button>
+        <button class="btn btn-primary" data-act="tpl-do-save">存为模板</button>
+      </div>`;
+    mask.classList.add('open');
+    setTimeout(() => restoreModalFocus(null, 't-name'), 30);
+    return;
+  }
+
+  if (state.tplApplying) {
+    const a = state.tplApplying;
+    modal.innerHTML = `
+      <div class="modal-head">
+        <h2>从模板新建</h2>
+        <button class="icon-btn" data-act="close-aux-modal">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <div class="field-label">模板</div>
+          <div class="hint">${esc(a.name)} · ${a.items} 个条目</div>
+        </div>
+        <div class="field">
+          <div class="field-label">从哪一天开始</div>
+          <input class="field-input" type="date" id="t-base" value="${escAttr(a.base)}">
+          <div class="hint">模板里存的是相对天数，这一批就按「基准日 + 第几天」铺开</div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" data-act="close-aux-modal">取消</button>
+        <button class="btn btn-primary" data-act="tpl-do-apply">创建</button>
+      </div>`;
+    mask.classList.add('open');
+    setTimeout(() => restoreModalFocus(null, 't-base'), 30);
+    return;
+  }
+
+  if (state.dayView) {
+    const entries = entriesOn(state.dayView);
+    const d = new Date(`${state.dayView}T00:00:00`);
+    modal.innerHTML = `
+      <div class="modal-head">
+        <h2>${d.getMonth() + 1} 月 ${d.getDate()} 日 · ${entries.length} 项</h2>
+        <button class="icon-btn" data-act="close-aux-modal">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="day-list">
+          ${entries.map(({ t, kind }) => {
+            const cat = catById(t.categoryId);
+            return `<div class="day-item ${t.status === 'done' ? 'is-done' : ''}"
+                         data-act="day-open" data-id="${t.id}">
+              <span class="cal-dot" style="background:${cat ? cat.color : '#CBD5E1'}"></span>
+              <span class="day-title">${hl(t.title)}</span>
+              ${kind === 'span'
+                ? '<span class="chip chip-stage">进行中</span>'
+                : t.status === 'done' ? '<span class="chip chip-ok">已完成</span>' : ''}
+            </div>`;
+          }).join('')}
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" data-act="close-aux-modal">关闭</button>
+        <button class="btn btn-primary" data-act="day-new" data-date="${state.dayView}">在这一天新建</button>
+      </div>`;
+    mask.classList.add('open');
+    return;
+  }
+
+  // 赞赏码。入口藏在设置页「关于」的最下面，这里只管把码放大到扫得动的尺寸。
+  // 图是微信导出的海报裁出来的（见 tools/prep_reward_qr.py），署名不在图上 ——
+  // 海报那行「xxx的赞赏码」和软件署名对不上，留着反而让人怀疑码是不是被换过。
+  if (state.reward) {
+    modal.innerHTML = `
+      <div class="modal-head">
+        <h2>赞赏</h2>
+        <button class="icon-btn" data-act="close-aux-modal">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="reward">
+          <img class="reward-qr" src="assets/reward-qr.png" alt="微信赞赏码" width="260" height="260">
+          <div class="reward-cap">微信扫一扫</div>
+        </div>
+        <div class="hint">工作记录本完全免费开源，赞赏纯属自愿，不影响任何功能。</div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" data-act="close-aux-modal">关闭</button>
+      </div>`;
+    mask.classList.add('open');
+    return;
+  }
+
   const e = state.editing;
 
   if (!e) { mask.classList.remove('open'); modal.innerHTML = ''; return; }
@@ -1582,9 +1932,9 @@ function renderModal() {
           </button>`).join('')}
       </div>
       <div class="hint">${{
-        once: '做一次就结束，适合临时任务',
+        once: '做一次就结束，适合临时任务。要拆成几步、看进度，就选「阶段性」',
         recurring: '按规则重复出现，适合周报、对账这类固定节奏',
-        stage: '持续一段时间的大任务，可以拆成多个子任务',
+        stage: '持续一段时间的大任务，保存后可以拆成多层子任务（最多三层）',
       }[e.pattern]}</div>
     </div>
 
@@ -1754,10 +2104,28 @@ async function completeOccurrence() {
 /** 子任务变动后只刷主区和抽屉：侧栏的计数算的是「一件工作」，不受步骤影响 */
 function renderAfterSubtaskChange() { renderView(); renderDrawer(); }
 
-async function addSubtask() {
-  const parentId = state.drawerId;
+/** 某个子任务连同它下面各级的 id。删一个节点时，它的后代也活不成。 */
+function subtreeIds(id) {
+  const out = [id];
+  subtasksOf(id).forEach(k => out.push(...subtreeIds(k)));
+  return out;
+}
+
+/** 后端拒绝的理由翻译成人话。返回原文会把 SQL/英文抛给用户看。 */
+function subErrText(e) {
+  const s = String(e);
+  if (s.includes('最多拆到')) return `最多拆到第 ${MAX_DEPTH} 层`;
+  if (s.includes('阶段性')) return '只有阶段性工作能拆子任务';
+  return '添加失败';
+}
+
+/** 追加一步。`parent` 给了就是给那个子任务再分小步，否则加在当前工作下面。
+ *  连加时输入框留在原地——一次拆五步不用每步都点一遍「+」。 */
+async function addSubtask(parent) {
+  const nest = Number(parent) || 0;
+  const parentId = nest || state.drawerId;
   if (!parentId) return;
-  const input = document.getElementById('d-sub-input');
+  const input = document.getElementById(nest ? 'd-sub-input-inline' : 'd-sub-input');
   const title = (input?.value || '').trim();
   if (!title) { input?.focus(); return; }
   input.value = '';
@@ -1767,16 +2135,17 @@ async function addSubtask() {
     try { created = await inv('create_subtask', { parentId, title }); }
     catch (e) {
       console.warn(e);
-      toast(String(e).includes('阶段性') ? '只有阶段性工作能拆子任务' : '添加失败');
+      toast(subErrText(e));
       return;
     }
   } else {
+    if (nest && !canNest(nest)) { toast(`最多拆到第 ${MAX_DEPTH} 层`); return; }
     created = { id: -(state.subtasks.length + 1), parentId, title, status: 'todo', pattern: 'once', note: '' };
   }
   state.subtasks.push(created);
   applySubtaskProgress();
   renderAfterSubtaskChange();
-  document.getElementById('d-sub-input')?.focus();   // 连着加几条不用每次点回来
+  document.getElementById(nest ? 'd-sub-input-inline' : 'd-sub-input')?.focus();
 }
 
 async function toggleSubtask(id) {
@@ -1790,12 +2159,16 @@ async function toggleSubtask(id) {
 }
 
 async function deleteSubtask(id) {
-  const i = state.subtasks.findIndex(x => x.id === id); if (i < 0) return;
-  state.subtasks.splice(i, 1);
+  const doomed = new Set(subtreeIds(id));
+  state.subtasks = state.subtasks.filter(x => !doomed.has(x.id));
+  if (doomed.has(state.subAddFor)) state.subAddFor = null;
   if (hasTauri) { try { await inv('delete_task', { id }); } catch (e) { console.warn(e); } }
   applySubtaskProgress();
   renderAfterSubtaskChange();
-  toast('已删掉这一步');
+  // 只想删一步、结果连它的下级一起没了，得说清楚——
+  // 不吭声的话用户会以为程序多删了东西
+  const extra = doomed.size - 1;
+  toast(extra > 0 ? `已删掉这一步，连同它下面的 ${extra} 个小步` : '已删掉这一步');
 }
 
 /** 改名落库。名字是空的就退回原名，不留一条没名字的步骤在库里。 */
@@ -1809,7 +2182,7 @@ async function renameSubtask(id, title) {
   renderAfterSubtaskChange();
 }
 
-function openEditor(id) {
+function openEditor(id, preset) {
   if (id) {
     const t = state.tasks.find(x => x.id === id);
     state.editing = JSON.parse(JSON.stringify(t));
@@ -1818,8 +2191,15 @@ function openEditor(id) {
       id: 0, title: '', note: '', categoryId: state.categories[0]?.id || 1,
       pattern: 'once', status: 'todo', dueAt: null, rule: { freq: 'weekly', byDay: [5], time: '17:00' },
     };
+    // 从日历格子点进来的：那一天就是要填的日期。
+    // 开始日和交期都先落在那天，用户切成「阶段性」也不用再选一遍
+    if (preset) Object.assign(state.editing, preset);
   }
   state.catEditing = null;
+  state.tplApplying = null;
+  state.tplSaving = null;
+  state.dayView = null;
+  state.reward = false;   // 赞赏码弹窗要是还开着，会把编辑器压在下面出不来（Ctrl+N 能触发）
   modalFocus = null;          // 新开的面板，别把上一条工作的光标位置带过来
   renderModal();
 }
@@ -1881,12 +2261,139 @@ async function saveModal() {
 async function deleteTask(id) {
   const i = state.tasks.findIndex(x => x.id === id); if (i < 0) return;
   state.tasks.splice(i, 1);
-  // 库那边是 ON DELETE CASCADE，内存里也要跟着清，否则步骤会一直飘着
-  state.subtasks = state.subtasks.filter(s => s.parentId !== id);
+  // 库那边是 ON DELETE CASCADE，内存里也要跟着清，否则步骤会一直飘着。
+  // 必须连子孙一起清：只滤掉直接子任务的话，第三层会变成没人认领的孤儿
+  const doomed = new Set([id, ...subtreeIds(id)]);
+  state.subtasks = state.subtasks.filter(s => !doomed.has(s.id));
+  if (doomed.has(state.subAddFor)) state.subAddFor = null;
   if (hasTauri) { try { await inv('delete_task', { id }); } catch (e) { console.warn(e); } }
   state.drawerId = null;
   renderAll_();
   toast('已删除');
+}
+
+/* ---------------- 复制一份 ---------------- */
+
+/** 复制当前这条，连同下面拆出来的各层步骤。
+ *  日期整体平移到今天起算——「这件事我下周还要再做一遍」是最常见的用法，
+ *  照着原日期复制出来的东西会落在过去。 */
+async function duplicateTask(id) {
+  const t = state.tasks.find(x => x.id === id);
+  if (!t) return;
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  try {
+    const created = await inv('duplicate_task', { id, base: todayLocal() });
+    await loadAll();
+    state.drawerId = created.id;     // 停在副本上，用户多半是要接着改它
+    renderAll_();
+    toast('已复制一份，日期从今天起算');
+  } catch (e) {
+    console.warn(e);
+    toast('复制失败');
+  }
+}
+
+/* ---------------- 模板库 ---------------- */
+
+/** 交期正好落在这天的全部工作。
+ *  和 `entriesOn` 的区别：这里**不含**跨天任务的中间日——
+ *  「顺延一天」要挪的是「今天该交的活」，把跨度中间的日子也算进去会误伤大任务。 */
+function tasksOn(dateStr) {
+  if (!dateStr) return [];
+  const key = startOfDay(new Date(`${dateStr}T00:00:00`)).getTime();
+  return sortTasks(scopeTasks().filter(t => {
+    const dl = deadlineOf(t);
+    return dl && startOfDay(new Date(dl)).getTime() === key;
+  }));
+}
+
+/** 「还有 N 项」：日历格子只摆得下 3 条，剩下的从这里看全。
+ *  口径跟格子完全一致，不这么做的话，格子说「还有 5 项」、
+ *  点开只列出 3 条，用户会以为界面漏了东西。 */
+function openDayView(dateStr) {
+  if (!entriesOn(dateStr).length) return;
+  state.dayView = dateStr;
+  state.editing = null;
+  state.catEditing = null;
+  state.tplApplying = null;
+  renderModal();
+}
+
+/** 「存为模板」：起个名字，把这条工作连同各层步骤一起存进模板库 */
+function openSaveTemplate() {
+  const t = state.tasks.find(x => x.id === state.drawerId);
+  if (!t) return;
+  state.tplSaving = { taskId: t.id, name: t.title, steps: descendantsOf(t.id).length };
+  state.editing = null;
+  state.catEditing = null;
+  state.tplApplying = null;
+  modalFocus = null;
+  renderModal();
+}
+
+async function doSaveTemplate() {
+  const s = state.tplSaving; if (!s) return;
+  const name = (document.getElementById('t-name')?.value || '').trim() || s.name;
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  try {
+    await inv('save_template', { taskId: s.taskId, name });
+    await loadAll();
+    state.tplSaving = null;
+    renderModal();
+    renderAll_();
+    toast(`已存成模板「${name}」`);
+  } catch (e) {
+    console.warn(e);
+    toast(`存模板失败：${e}`);
+  }
+}
+
+/** 「从模板新建」：先挑基准日，模板里的相对天数都从这天起算 */
+function openApplyTemplate(id) {
+  const t = (state.templates || []).find(x => x.id === id);
+  if (!t) return;
+  state.tplApplying = { id, name: t.name, items: t.items.length, base: todayLocal() };
+  state.editing = null;
+  state.catEditing = null;
+  state.tplSaving = null;
+  modalFocus = null;
+  renderModal();
+}
+
+async function doApplyTemplate() {
+  const a = state.tplApplying; if (!a) return;
+  const base = document.getElementById('t-base')?.value || a.base;
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  try {
+    const n = await inv('apply_template', { id: a.id, base });
+    await loadAll();
+    state.tplApplying = null;
+    renderModal();
+    state.view = 'all';        // 建出来的东西得让人看见，直接送到「全部工作」
+    renderAll_();
+    toast(`已新建 ${n} 件工作，日期从 ${base} 起算`);
+  } catch (e) {
+    console.warn(e);
+    toast(`新建失败：${e}`);
+  }
+}
+
+async function deleteTemplate(id) {
+  const t = (state.templates || []).find(x => x.id === id);
+  if (!t) return;
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  // 模板删了不影响已经建出来的工作，这一点要说清楚，否则用户不敢删
+  const yes = await askDialog(
+    `模板「${t.name}」会被删除，之后不能再从它新建。\n已经建出来的工作不受影响。`,
+    '删除模板',
+  );
+  if (!yes) return;
+  try {
+    await inv('delete_template', { id });
+    state.templates = state.templates.filter(x => x.id !== id);
+    renderView();
+    toast('模板已删除');
+  } catch (e) { console.warn(e); toast('删除失败'); }
 }
 
 /* ---------------- 分类管理 ---------------- */
@@ -1899,6 +2406,7 @@ function openCatEditor(id) {
     state.catEditing = { id: 0, name: '', color: PALETTE[state.categories.length % PALETTE.length] };
   }
   state.editing = null;
+  state.reward = false;
   modalFocus = null;
   renderModal();
 }
@@ -2056,9 +2564,73 @@ function toast(msg) {
 
 function renderAll_() { renderSidebar(); renderView(); renderDrawer(); }
 
+/* ---------------- 日历上的右键菜单 ---------------- */
+
+/** 从日历某天新建时预填的日期。开始日和交期都先落在那天，
+ *  用户切成「阶段性」也不用再选一遍——那时两个输入框都已经是对的。 */
+const dayPreset = dateStr => dateStr ? {
+  dueAt: new Date(`${dateStr}T18:00:00`).toISOString(),
+  endAt: new Date(`${dateStr}T23:59:00`).toISOString(),
+} : null;
+
+function closeCtxMenu() {
+  const el = document.getElementById('ctx-menu');
+  if (el && typeof el.remove === 'function') el.remove();
+  state.ctxMenu = null;
+}
+
+function showCtxMenu(dateStr, x, y) {
+  closeCtxMenu();
+  state.ctxMenu = { date: dateStr };
+
+  const n = tasksOn(dateStr).length;
+  const el = document.createElement('div');
+  el.className = 'ctx-menu';
+  el.id = 'ctx-menu';
+  el.innerHTML = `
+    <button data-ctx="new">在这一天新建</button>
+    ${n ? `<button data-ctx="day">查看当天 ${n} 项</button>
+           <button data-ctx="push">把这一天的工作顺延一天</button>` : ''}
+    <button data-ctx="today">回到今天</button>`;
+  // 菜单别顶出窗口：靠右下的格子右键时会跑到屏幕外
+  el.style.left = `${Math.min(x, Math.max(0, window.innerWidth - 180))}px`;
+  el.style.top  = `${Math.min(y, Math.max(0, window.innerHeight - 150))}px`;
+  document.body.appendChild(el);
+
+  el.addEventListener('click', ev => {
+    const b = ev.target.closest('[data-ctx]');
+    if (!b) return;
+    const d = state.ctxMenu?.date;
+    const k = b.dataset.ctx;
+    closeCtxMenu();     // 先收菜单再干活，否则后面的重绘会把菜单留在原地
+    if (k === 'new')   openEditor(null, dayPreset(d));
+    if (k === 'day')   openDayView(d);
+    if (k === 'push')  pushDay(d);
+    if (k === 'today') { state.calMonth = null; renderView(); }
+  });
+}
+
+/** 把这天还没做完的整体往后挪一天。
+ *  「今天做不完了，都挪到明天」比一条条改日期快得多，也少一次漏改。
+ *  阶段性工作的开始日和交期一起挪，跨度保持不变。 */
+async function pushDay(dateStr) {
+  const list = tasksOn(dateStr).filter(t => t.status !== 'done');
+  if (!list.length) { toast('这一天没有待处理的工作'); return; }
+  const iso = s => s ? new Date(new Date(s).getTime() + DAY).toISOString() : null;
+  for (const t of list) {
+    t.dueAt = iso(t.dueAt);
+    t.endAt = iso(t.endAt);
+    t.remindAt = iso(t.remindAt);
+    if (hasTauri) { try { await inv('update_task', { task: t }); } catch (e) { console.warn(e); } }
+  }
+  renderAll_();
+  toast(`已把 ${list.length} 项顺延一天`);
+}
+
 /* ---------------- 事件绑定 ---------------- */
 function bind() {
   document.body.addEventListener('click', ev => {
+    closeCtxMenu();   // 点哪儿都先把右键菜单收掉
     // data-act 优先于 data-nav：分类行里嵌着编辑按钮，不能点按钮却跳了视图
     const act = ev.target.closest('[data-act]');
     if (act) {
@@ -2067,9 +2639,11 @@ function bind() {
 
       if (a === 'toggle')   { toggleTask(id); return; }
       if (a === 'open')     { state.drawerId = id; renderDrawer(); return; }
-      if (a === 'close-drawer') { state.drawerId = null; renderDrawer(); return; }
+      if (a === 'close-drawer') { state.drawerId = null; state.subAddFor = null; renderDrawer(); return; }
       if (a === 'delete')   { deleteTask(state.drawerId); return; }
       if (a === 'edit')     { const x = state.drawerId; state.drawerId = null; renderDrawer(); openEditor(x); return; }
+      if (a === 'duplicate')        { duplicateTask(state.drawerId); return; }
+      if (a === 'save-as-template') { openSaveTemplate(); return; }
       if (a === 'close-modal') { state.editing = null; modalFocus = null; renderModal(); return; }
 
       // 下面几个控件都会让弹窗整块重绘，所以动手前必须先把已输入的内容收回来，
@@ -2136,11 +2710,39 @@ function bind() {
         return;
       }
       if (a === 'cal-today') { state.calMonth = null; renderView(); return; }
+      // 点空白格＝在那天新建。这个动作以前完全没有，日历上最自然的操作反而是做不到的
+      if (a === 'cal-new') { openEditor(null, dayPreset(act.dataset.date)); return; }
+      if (a === 'cal-day') { openDayView(act.dataset.date); return; }
 
       // 子任务
       if (a === 'sub-toggle')  { toggleSubtask(id); return; }
       if (a === 'sub-del')     { deleteSubtask(id); return; }
-      if (a === 'add-subtask') { addSubtask(); return; }
+      if (a === 'add-subtask') { addSubtask(act.dataset.parent); return; }
+      if (a === 'sub-add-for') {
+        // 再点一次收起。同一个入口既开又关，省一个「取消」按钮
+        state.subAddFor = state.subAddFor === id ? null : id;
+        renderDrawer();
+        document.getElementById('d-sub-input-inline')?.focus();
+        return;
+      }
+
+      // 辅助面板：存模板 / 从模板新建 / 按日查看 / 赞赏码
+      if (a === 'open-reward') { state.reward = true; renderModal(); return; }
+      if (a === 'close-aux-modal') {
+        state.tplApplying = null; state.tplSaving = null; state.dayView = null;
+        state.reward = false;
+        renderModal(); return;
+      }
+      if (a === 'tpl-do-save')  { doSaveTemplate();  return; }
+      if (a === 'tpl-do-apply') { doApplyTemplate(); return; }
+      if (a === 'tpl-apply')    { openApplyTemplate(id); return; }
+      if (a === 'tpl-del')      { deleteTemplate(id); return; }
+      if (a === 'day-open') {
+        state.dayView = null; renderModal();
+        state.drawerId = id; renderDrawer();
+        return;
+      }
+      if (a === 'day-new') { state.dayView = null; openEditor(null, dayPreset(act.dataset.date)); return; }
 
       // 设置项
       if (a === 'toggle-setting') {
@@ -2184,7 +2786,20 @@ function bind() {
     const nav = ev.target.closest('[data-nav]');
     if (nav) { state.view = nav.dataset.nav; renderAll_(); return; }
 
-    if (ev.target.id === 'modal-mask') { state.editing = null; state.catEditing = null; renderModal(); return; }
+    if (ev.target.id === 'modal-mask') {
+      state.editing = null; state.catEditing = null; state.reward = false;
+      renderModal();
+      return;
+    }
+
+    // 抽屉是并排布局、没有遮罩，「点旁边空白」是用户最自然的关闭动作。
+    // 只有角上的 X 和 Esc 能关的话，会被当成「关不掉」——这正是有人反馈的那条。
+    // 标题栏除外：那是拖窗口和点窗口按钮的地方，顺手关掉抽屉会很烦人。
+    if (state.drawerId && !ev.target.closest('.drawer') && !ev.target.closest('.titlebar')) {
+      state.drawerId = null;
+      state.subAddFor = null;
+      renderDrawer();
+    }
   });
 
   document.getElementById('btn-new').addEventListener('click', () => openEditor(null));
@@ -2213,11 +2828,59 @@ function bind() {
     if (ev.key === 'Escape') {
       // 正在输入时按 Esc 只退出输入，不顺手把整个面板关掉
       if (typing) { el.blur(); return; }
-      if (state.catEditing) { state.catEditing = null; renderModal(); }
+      if (state.ctxMenu) { closeCtxMenu(); }
+      else if (state.dayView || state.tplApplying || state.tplSaving || state.reward) {
+        state.dayView = null; state.tplApplying = null; state.tplSaving = null;
+        state.reward = false;
+        renderModal();
+      }
+      else if (state.catEditing) { state.catEditing = null; renderModal(); }
       else if (state.editing) { state.editing = null; renderModal(); }
+      // 「加下级」的输入框先收，再考虑整个抽屉——一次 Esc 只退一层
+      else if (state.subAddFor) { state.subAddFor = null; renderDrawer(); }
       else if (state.drawerId) { state.drawerId = null; renderDrawer(); }
     }
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'n') { ev.preventDefault(); openEditor(null); }
+  });
+
+  // 日历上滚轮翻月。监听挂在 document 上，因为日历每次重绘都会换掉整块 DOM，
+  // 挂在下层元素上翻一次月就失效了。
+  // 250ms 节流是必须的：wheel 一秒能触发几十次，不节流会一口气翻十几月。
+  let calWheelAt = 0;
+  document.addEventListener('wheel', ev => {
+    if (state.mode !== 'calendar') return;
+    if (!ev.target.closest?.('.cal-grid')) return;
+
+    // 页面本身还能滚就先让它滚：不判断的话，「往下看点内容」会变成翻月。
+    // 只有在滚动已经到头、没有别的去向时，滚轮才接管翻月。
+    const view = document.getElementById('view');
+    const sh = view?.scrollHeight, ch = view?.clientHeight;
+    if (Number.isFinite(sh) && Number.isFinite(ch) && sh > ch + 1) {
+      const atTop = view.scrollTop <= 0;
+      const atBottom = view.scrollTop + ch >= sh - 1;
+      if ((ev.deltaY < 0 && !atTop) || (ev.deltaY > 0 && !atBottom)) return;
+    }
+
+    const now = Date.now();
+    if (now - calWheelAt < 250) return;
+    calWheelAt = now;
+    ev.preventDefault?.();
+
+    const base = state.calMonth || new Date();
+    state.calMonth = new Date(base.getFullYear(), base.getMonth() + (ev.deltaY > 0 ? 1 : -1), 1);
+    renderView();
+  }, { passive: false });
+
+  // 日历格子上右键：新建 / 看全当天 / 整体顺延。
+  // 必须 preventDefault，否则 WebView 会弹出系统的「刷新、复制」菜单盖在上面。
+  document.addEventListener('contextmenu', ev => {
+    const cell = ev.target.closest?.('.cal-cell');
+    if (cell && state.mode === 'calendar') {
+      ev.preventDefault?.();
+      showCtxMenu(cell.dataset?.date, ev.clientX || 0, ev.clientY || 0);
+      return;
+    }
+    closeCtxMenu();
   });
 
   bindCatDnD();

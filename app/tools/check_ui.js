@@ -8,6 +8,14 @@ const path = require('path');
 const vm = require('vm');
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'ui', 'assets', 'app.js'), 'utf8');
+const rawHtml = fs.readFileSync(path.join(__dirname, '..', 'ui', 'index.html'), 'utf8');
+// 版本号有四个地方要同步：Cargo.toml、tauri.conf.json、前端兜底常量、exe 文件名。
+// 这里把它们对起来，省得改一处漏一处——漏了的话用户看到的版本和 exe 属性对不上。
+const cargoToml = fs.readFileSync(path.join(__dirname, '..', 'src-tauri', 'Cargo.toml'), 'utf8');
+const cargoVer = (cargoToml.match(/^version\s*=\s*"([^"]+)"/m) || [])[1];
+const confVer = JSON.parse(
+  fs.readFileSync(path.join(__dirname, '..', 'src-tauri', 'tauri.conf.json'), 'utf8'),
+).version;
 // 掐掉末尾的启动 IIFE（它会去碰 DOM），只留纯逻辑
 const body = src.split('/* ---------------- 启动 ---------------- */')[0];
 
@@ -58,23 +66,27 @@ function makeDom() {
 
 const dom = makeDom();
 const bodyHandlers = {};
+const docHandlers = {};   // keydown / wheel 是挂在 document 上的，和 body 上的分开收
 
 const ctx = {
   console,
   window: {},                     // 没有 __TAURI__ → 走预览数据
   document: {
     activeElement: null,
-    addEventListener() {},
+    addEventListener: (t, fn) => { (docHandlers[t] = docHandlers[t] || []).push(fn); },
     getElementById: dom.get,
     querySelectorAll: () => [],
     body: { addEventListener: (t, fn) => { (bodyHandlers[t] = bodyHandlers[t] || []).push(fn); } },
   },
   requestAnimationFrame: fn => fn(),
   setTimeout, clearTimeout,
+  // keydown 处理器用 `el instanceof HTMLElement` 判「焦点是不是落在输入框上」。
+  // 放一个空类在这里：模拟出来的 target 都不是它的实例，等价于「焦点不在输入框」。
+  HTMLElement: class HTMLElement {},
 };
 vm.createContext(ctx);
 vm.runInContext(
-  body + '\n;globalThis.__api = { state, loadAll, taskRow, subtaskEditor, applySubtaskProgress, subtasksOf, renderDrawer, renderBoard, renderCalendar, laneOf, scopeTasks, bind, openEditor, syncEditorFields, ruleLabel, quarterMonths, dayText, nextOccurrence, defaultRuleFor, FREQS, renderSettings, stampName };',
+  body + '\n;globalThis.__api = { state, loadAll, taskRow, subtaskEditor, subtasksOf, descendantsOf, depthOf, canNest, subtreeIds, applySubtaskProgress, renderDrawer, renderBoard, renderCalendar, renderTemplates, renderSidebar, renderModal, renderSettings, openDayView, entriesOn, tasksOn, dayPreset, toLocalDate, laneOf, scopeTasks, bind, openEditor, syncEditorFields, ruleLabel, quarterMonths, dayText, nextOccurrence, defaultRuleFor, FREQS, stampName, MAX_DEPTH, APP_NAME_CN, APP_NAME_EN, APP_VERSION_FALLBACK, APP_COPYRIGHT };',
   ctx,
 );
 
@@ -108,24 +120,42 @@ vm.runInContext(
 
   /* ---- 子任务与进度 ---- */
   ok('阶段性工作的进度由子任务算出',
-    stage.progress.done === 3 && stage.progress.total === 5, JSON.stringify(stage.progress));
-  ok('行上显示 done/total', row(stage.id).includes('3/5'));
-  ok('进度条宽度按完成比例', /width:60%/.test(row(stage.id)));
+    stage.progress.done === 4 && stage.progress.total === 7, JSON.stringify(stage.progress));
+  ok('行上显示 done/total', row(stage.id).includes('4/7'));
+  ok('进度条宽度按完成比例', /width:57\.14/.test(row(stage.id)));
   ok('抽屉里子任务条数与数据一致',
-    (api.subtaskEditor(stage).match(/class="sub-item/g) || []).length === 5);
+    (api.subtaskEditor(stage).match(/class="sub-item/g) || []).length === 7);
 
-  // 全部勾上 → 行上提示可以收尾
-  api.subtasksOf(stage.id).forEach(s => { s.status = 'done'; });
+  // 全部勾上 → 行上提示可以收尾。必须连第二层一起勾，
+  // 进度算的是整棵子树，漏掉一层就永远凑不齐
+  api.descendantsOf(stage.id).forEach(s => { s.status = 'done'; });
   api.applySubtaskProgress();
   ok('子任务全完成时行上提示「待收尾」', row(stage.id).includes('待收尾'));
 
   // 一个都没有 → 不显示进度条，也不假装有进度
-  api.subtasksOf(stage.id).forEach(s => { s.status = 'todo'; });
+  api.descendantsOf(stage.id).forEach(s => { s.status = 'todo'; });
   state.subtasks = state.subtasks.filter(s => s.parentId !== stage.id);
   api.applySubtaskProgress();
   ok('没有子任务时进度归零', stage.progress.total === 0 && stage.progress.done === 0);
   ok('没有子任务时不画进度条', !/class="progress"/.test(row(stage.id)));
   ok('没有子任务时提示「未拆解」', row(stage.id).includes('未拆解'));
+
+  /* ---- 三层拆解 ----
+     工作 → 子任务 → 子子任务，第三层封顶。
+     界面上越界的那一层直接不给「+」入口，而不是让人点了才被告知不行。 */
+  await api.loadAll();
+  const deep = api.subtasksOf(stage.id).find(s => s.title === '移动端适配');
+  const grand = state.subtasks.find(s => s.title === '触屏点击区放大');
+  ok('第二层的步骤还能再往下拆', api.canNest(deep.id), `第 ${api.depthOf(deep.id)} 层`);
+  ok('第三层的步骤不能再拆', !api.canNest(grand.id), `第 ${api.depthOf(grand.id)} 层`);
+  ok('层数上限就是三层', api.MAX_DEPTH === 3);
+
+  const editor = api.subtaskEditor(stage);
+  ok('第二层的下级被渲染出来', editor.includes('窄屏（&lt; 900px）走查') || editor.includes('窄屏（< 900px）走查'));
+  ok('第二层带自己的下级完成标记', /class="sub-ratio"[^>]*>1\/2</.test(editor), '移动端适配 1/2');
+  ok('第三层的行缩进一层', /data-depth="2"/.test(editor));
+  ok('删一步会连它的下级一起算',
+    api.subtreeIds(deep.id).length === 3, `连它自己共 ${api.subtreeIds(deep.id).length} 个`);
 
   /* ---- 看板 ---- */
   // 上面的用例把子任务删干净了，这里先把数据复位，否则量到的是被改动过的状态
@@ -164,6 +194,84 @@ vm.runInContext(
   ok('日历只标一个「今天」', (cal.match(/is-today/g) || []).length === 1);
   // 长标题必须用一个能收缩的 span 包着，否则 flex 容器上省略号不生效、整排会被撑宽
   ok('日历条目标题包在可收缩的 span 里', /class="cal-text"/.test(cal));
+
+  /* ---- 日历：空白格可点、还有 N 项可展开 ----
+     用户反馈「日历上双击/右击都没反应，浪费了」。真正的硬伤其实是
+     连单击都没有——「我想在某天加一件事」这个最自然的动作在日历上做不到。 */
+  ok('日历空白格可点，点了在那天新建',
+    /data-act="cal-new" data-date="\d{4}-\d{2}-\d{2}"/.test(cal));
+  ok('每一格都带着自己的日期',
+    (cal.match(/data-act="cal-new"/g) || []).length === cells,
+    `${(cal.match(/data-act="cal-new"/g) || []).length} 个入口 / ${cells} 个格子`);
+
+  // 造一天 4 项，把「还有 N 项」逼出来（格子最多只摆 3 条）
+  const nowD = new Date();
+  const busyIso = new Date(nowD.getFullYear(), nowD.getMonth(), nowD.getDate(), 18).toISOString();
+  state.tasks.push(...[1, 2, 3, 4].map(i => ({
+    id: 9000 + i, title: `临时项 ${i}`, note: '', categoryId: 1,
+    pattern: 'once', status: 'todo', dueAt: busyIso,
+  })));
+  const calBusy = api.renderCalendar();
+  ok('同一天超过 3 项时给出「还有 N 项」入口',
+    /class="cal-more" data-act="cal-day" data-date="[\d-]+"/.test(calBusy));
+  const busyDay = (calBusy.match(/data-act="cal-day" data-date="([\d-]+)"/) || [])[1];
+  ok('「还有 N 项」带上了那天的日期', !!busyDay);
+  ok('按日期能取回当天全部工作', api.entriesOn(busyDay).length >= 4,
+    `${api.entriesOn(busyDay).length} 项`);
+
+  api.openDayView(busyDay);
+  const dayHtml = dom.modal.innerHTML;
+  ok('按日弹窗把当天每条都列出来',
+    (dayHtml.match(/class="day-item/g) || []).length === api.entriesOn(busyDay).length,
+    `${(dayHtml.match(/class="day-item/g) || []).length} 条`);
+  ok('按日弹窗里能直接在这一天新建', /data-act="day-new" data-date="/.test(dayHtml));
+  state.dayView = null;
+  api.renderModal();
+  state.tasks = state.tasks.filter(t => t.id < 9000);
+
+  ok('从日历某天新建时预填那天',
+    new Date(api.dayPreset('2026-10-05').dueAt).getDate() === 5);
+  ok('预填的日子连交期一起给上（切成阶段性就不用再选）',
+    new Date(api.dayPreset('2026-10-05').endAt).getDate() === 5);
+  ok('没给日期就不预填', api.dayPreset('') === null);
+
+  /* ---- 跨天任务在日历上显示整段跨度 ----
+     只标交期的话，一个跨三周的大任务在日历上只出现一格，
+     中间这段时间在忙什么完全看不出来。 */
+  {
+    const s = state.tasks.find(t => t.pattern === 'stage');
+    const bak = { due: s.dueAt, end: s.endAt };
+    const from = new Date(); from.setDate(from.getDate() + 1); from.setHours(9, 0, 0, 0);
+    const to = new Date(); to.setDate(to.getDate() + 5); to.setHours(23, 59, 0, 0);
+    s.dueAt = from.toISOString();
+    s.endAt = to.toISOString();
+
+    const mid = new Date(); mid.setDate(mid.getDate() + 3);
+    const midStr = api.toLocalDate(mid);
+    const midEntries = api.entriesOn(midStr);
+
+    ok('跨天工作在跨度中间那天也露出来',
+      midEntries.some(e => e.t.id === s.id && e.kind === 'span'),
+      JSON.stringify(midEntries.map(e => e.kind)));
+    ok('交期那天算「due」，不算「span」',
+      api.entriesOn(api.toLocalDate(to)).some(e => e.t.id === s.id && e.kind === 'due'));
+    ok('日历上能看出跨度条是淡的', /cal-item is-span/.test(api.renderCalendar()));
+    // 同一天里既有别的任务的交期、又有这条的跨度条时，交期要排在前面
+    const other = state.tasks.find(t => t.pattern !== 'stage' && t.status !== 'done');
+    const bakOther = other.dueAt;
+    other.dueAt = mid.toISOString();
+    const mixed = api.entriesOn(midStr);
+    ok('同一天里交期排在跨度条前面',
+      mixed.some(e => e.kind === 'span') &&
+      mixed.findIndex(x => x.kind === 'due') < mixed.findIndex(x => x.kind === 'span'),
+      JSON.stringify(mixed.map(e => e.kind)));
+    other.dueAt = bakOther;
+    // 「顺延一天」挪的是「今天该交的活」，把跨度中间的日子也算进去会误伤大任务
+    ok('顺延只认交期，不认跨度中间日',
+      !api.tasksOn(midStr).some(t => t.id === s.id));
+
+    s.dueAt = bak.due; s.endAt = bak.end;
+  }
 
   /* ---- 表单重绘不丢内容 ----
      用户报过的问题：新建工作里填好标题，再去选分类或换节奏类型，标题就没了。
@@ -266,12 +374,146 @@ vm.runInContext(
   ok('设置页仍然标着数据存放位置', /数据存放位置/.test(settings));
   ok('给用户看的不是数据库内部术语', !/VACUUM|ATTACH/.test(settings));
 
+  /* ---- 关于 / 版权 ---- */
+  ok('设置页有「关于」区块', /section-title">关于</.test(settings));
+  ok('关于里同时挂着中英双名',
+    settings.includes(api.APP_NAME_CN) && settings.includes(api.APP_NAME_EN));
+  ok('关于里写了版权署名', settings.includes('JJAI'), api.APP_COPYRIGHT);
+  ok('关于里的版本号就是打包版本',
+    settings.includes(`版本 ${api.APP_VERSION_FALLBACK}`), `界面写着 ${api.APP_VERSION_FALLBACK}`);
+  // 版本号散在四处，这里把它们串起来对一遍
+  ok('Cargo.toml 与 tauri.conf.json 的版本号一致',
+    !!cargoVer && cargoVer === confVer, `Cargo ${cargoVer} / conf ${confVer}`);
+  ok('前端兜底版本号跟得上打包版本',
+    api.APP_VERSION_FALLBACK === cargoVer, `前端 ${api.APP_VERSION_FALLBACK} / Cargo ${cargoVer}`);
+  ok('标题栏同时挂着中英双名',
+    rawHtml.includes(`>${api.APP_NAME_CN}<`) && rawHtml.includes(`>${api.APP_NAME_EN}<`));
+
+  /* ---- 开关的默认值 ----
+     开机自启必须默认关：它要往系统里写启动项，不能替用户做这个决定，
+     而且那正是杀软行为引擎最敏感的动作。其余开关只是程序内部行为，默认开。 */
+  const switchOn = key => {
+    const m = settings.match(new RegExp(`class="switch([^"]*)"[^>]*data-key="${key}"`));
+    return !!m && /(^|\s)on(\s|$)/.test(m[1]);
+  };
+  ok('开机自启默认是关的', !switchOn('autostart'));
+  ok('到期提醒默认开着', switchOn('notify'));
+  ok('最小化到托盘默认开着', switchOn('tray'));
+  ok('提醒开着、自启关着时，把「重启后收不到提醒」讲明白',
+    /重启电脑后就收不到提醒/.test(settings));
+  state.settings.autostart = '1';
+  ok('打开自启后那条提醒就消失了',
+    !/重启电脑后就收不到提醒/.test(api.renderSettings()));
+  delete state.settings.autostart;
+
   /* ---- 备份文件名 ---- */
   const bakName = api.stampName('db');
   ok('备份文件名带日期时间，连备份两次不会互相覆盖',
     /^工作记录本-\d{8}-\d{4}\.db$/.test(bakName));
   ok('CSV 用同一个命名规则，只是后缀不同',
     api.stampName('csv').endsWith('.csv') && api.stampName('csv').startsWith('工作记录本-'));
+
+  /* ---- 模板库 ----
+     反馈里最有价值的一条：「同一套 20 个任务和子任务反复手建，费时又烦」。
+     模板要解决的是这个重复劳动，不是层级不够深。 */
+  const tplSrc = api.renderTemplates();
+  ok('模板页列出全部模板',
+    (tplSrc.match(/class="tpl-card"/g) || []).length === state.templates.length,
+    `${state.templates.length} 个`);
+  ok('模板卡片写清有几件工作、几个条目', /件工作/.test(tplSrc) && /个条目/.test(tplSrc));
+  ok('多层结构标出层数', /\d 层结构/.test(tplSrc));
+  ok('模板卡片有「新建一批」入口', /data-act="tpl-apply"/.test(tplSrc));
+  ok('模板卡片有删除入口', /data-act="tpl-del"/.test(tplSrc));
+
+  // 这是整个模板设计的关键：存绝对日期的话，下个月调用就是一堆过期任务
+  ok('模板里存的是相对天数，不是绝对日期',
+    state.templates.every(t => t.items.every(i => !('dueAt' in i) && !('endAt' in i))));
+  ok('模板条目的偏移能表达跨天跨度',
+    state.templates[0].items.some(i => (i.endOffset ?? 0) > (i.dueOffset ?? 0)));
+
+  // 空模板库要说清怎么建，而不是只留一片空白
+  {
+    const bak = state.templates;
+    state.templates = [];
+    const empty = api.renderTemplates();
+    state.templates = bak;
+    ok('没有模板时给出「怎么建」的指引', /存为模板/.test(empty));
+    ok('空模板库里不摆卡片', !/class="tpl-card"/.test(empty));
+  }
+
+  /* ---- 侧栏的模板入口 ---- */
+  api.renderSidebar();
+  const side = dom.get('sidebar').innerHTML;
+  ok('侧栏有「模板」入口', /data-nav="tpl"/.test(side));
+  ok('模板入口带模板数量', /data-nav="tpl"[\s\S]{0,200}?nav-count">\d+</.test(side));
+
+  /* ---- 抽屉里的复制与存模板 ----
+     放在最后跑：renderDrawer 会先把输入框里的内容收回 state，
+     这里没有真输入框（值都是空的），日期字段会被清掉，不适合再往下测数据。 */
+  state.drawerId = stage.id;
+  api.renderDrawer();
+  const drawer = dom.get('drawer').innerHTML;
+  ok('抽屉里有「复制一份」入口', /data-act="duplicate"/.test(drawer));
+  ok('抽屉里有「存为模板」入口', /data-act="save-as-template"/.test(drawer));
+  ok('抽屉说明了模板会连步骤一起存', /步骤一起存成模板/.test(drawer));
+  state.drawerId = null;
+
+  /* ---- 赞赏码 ----
+     入口刻意做得不起眼：藏在设置页「关于」最下面，和版本、版权信息并排。
+     但几条底线得盯住 —— 图真打进去了、码够大扫得动、文案把性质说清楚了。
+     另外原始海报上那行「xxx的赞赏码」不能出现：那个昵称和软件署名对不上，
+     留在界面里会让用户怀疑码是不是被人换过。 */
+  ok('设置页「关于」里有赞赏入口', settings.includes('data-act="open-reward"'));
+
+  const qrPath = path.join(__dirname, '..', 'ui', 'assets', 'reward-qr.png');
+  ok('赞赏码图片打进了前端资源', fs.existsSync(qrPath));
+  if (fs.existsSync(qrPath)) {
+    const qb = fs.readFileSync(qrPath);
+    const qw = qb.readUInt32BE(16), qh = qb.readUInt32BE(20);
+    ok('赞赏码是正方形', qw === qh, `${qw}x${qh}`);
+    // 微信实测小于 200px 就不容易扫出来；卡 400 是给 2x 屏留的余量
+    ok('赞赏码边长够扫（≥400px）', qw >= 400, `${qw}px`);
+    ok('赞赏码用 PNG 无损，有损压缩会糊掉码点',
+      qb.slice(1, 4).toString('ascii') === 'PNG');
+  }
+
+  const clickMask = () => (bodyHandlers.click || []).forEach(fn => fn({
+    target: { id: 'modal-mask', closest: () => null },
+  }));
+  const pressKey = k => [...(docHandlers.keydown || []), ...(bodyHandlers.keydown || [])]
+    .forEach(fn => fn({
+      key: k, target: null, ctrlKey: false, metaKey: false, preventDefault() {},
+    }));
+
+  state.reward = true;
+  api.renderModal();
+  const rewardHtml = dom.modal.innerHTML;
+  ok('赞赏弹窗里挂着二维码图片', /assets\/reward-qr\.png/.test(rewardHtml));
+  ok('赞赏弹窗讲明「免费开源 · 赞赏自愿 · 不影响功能」',
+    /完全免费开源/.test(rewardHtml) && /自愿/.test(rewardHtml) && /不影响任何功能/.test(rewardHtml));
+  ok('赞赏弹窗不出现和软件署名对不上的个人昵称', !/大胡子俊杰/.test(rewardHtml));
+
+  // 三条关闭路径都得通：用户之前就报过「点外面关不掉」
+  clickMask();
+  ok('点弹窗外面能关掉赞赏码', state.reward === false);
+
+  state.reward = true; api.renderModal();
+  click({ dataset: { act: 'close-aux-modal' } });
+  ok('弹窗上的关闭按钮能关掉赞赏码', state.reward === false);
+
+  state.reward = true; api.renderModal();
+  pressKey('Escape');
+  ok('按 Esc 能关掉赞赏码', state.reward === false);
+
+  // Ctrl+N 在弹窗开着时也能触发（监听挂在 document 上）。不把 reward 清掉的话，
+  // 编辑器会被赞赏码盖在后面，用户看到的是「快捷键没反应」。
+  state.reward = true;
+  api.renderModal();
+  api.openEditor(null);
+  ok('赞赏码开着时新建工作，编辑器不会被挡在后面',
+    state.reward === false && !!state.editing);
+  state.editing = null;
+  api.renderModal();
 
   console.log('---- 渲染自检 ----');
   checks.forEach(([s, n, e]) => console.log(`  ${s}  ${n}${e ? '  → ' + e : ''}`));

@@ -1,6 +1,6 @@
 /* 生成一份「打开就停在指定视图」的界面副本，用于截图校对。
    用法：node tools/make_preview.js <视图> [输出目录] [--empty] [--drawer=<id>] [--mode=<list|board|calendar>]
-                                          [--modal=recurring.quarterly | once | stage | cat]
+                                          [--modal=recurring.quarterly | once | stage | cat | reward]
    --empty        检查空数据下的表现（全新安装、还没录过任何工作）
    --drawer=<id>  打开时顺便展开某条工作的详情抽屉
    --mode=xxx     排布方式；日历默认停在 2026-09，方便和 mock 数据对上
@@ -44,6 +44,7 @@ js += `
 function __previewModal(spec) {
   const [pat, freq] = spec.split('.');
   if (pat === 'cat') { openCatEditor(null); return; }
+  if (pat === 'reward') { state.reward = true; renderModal(); return; }
   openEditor(null);
   const e = state.editing;
   e.pattern = pat || 'once';
@@ -62,7 +63,19 @@ function __previewModal(spec) {
 `;
 
 fs.writeFileSync(path.join(out, 'assets', 'app.js'), js);
-fs.copyFileSync(path.join(app, 'ui', 'assets', 'style.css'), path.join(out, 'assets', 'style.css'));
-fs.copyFileSync(path.join(app, 'ui', 'index.html'), path.join(out, 'index.html'));
+// 除 app.js（上面那份是注入过的）以外的资源整份带过去。
+// 漏了图片的话预览里二维码是裂的，截图就校对不出真实效果。
+for (const f of fs.readdirSync(path.join(app, 'ui', 'assets'))) {
+  if (f !== 'app.js') fs.copyFileSync(path.join(app, 'ui', 'assets', f), path.join(out, 'assets', f));
+}
+// 截图要的是「动画已经跑完」的样子：.modal 带 180ms 的 pop 动画（opacity 0 → 1），
+// 无头浏览器常常在动画中途就截了图，弹窗看着半透明、背后内容透过来。
+// 只对这份静态副本生效，真实程序里的动画照常。
+let html = fs.readFileSync(path.join(app, 'ui', 'index.html'), 'utf8');
+if (modal) {
+  html = html.replace('</head>',
+    '<style>*, *::before, *::after { animation: none !important; transition: none !important; }</style>\n</head>');
+}
+fs.writeFileSync(path.join(out, 'index.html'), html);
 
 console.log(path.join(out, 'index.html'));

@@ -1,8 +1,8 @@
 [package]
 name = "worklog"
-version = "1.0.0"
-description = "工作记录本 - 单文件绿色的本地工作记录与周期排期工具"
-authors = ["worklog"]
+version = "1.2.0"
+description = "工作记录本 (WorkLuLu) - 单文件绿色的本地工作记录与周期排期工具"
+authors = ["JJAI"]
 edition = "2021"
 rust-version = "1.77"
 

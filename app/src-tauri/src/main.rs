@@ -13,6 +13,11 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, Runtime, WindowEvent};
 
+/// 对外的软件名：中文主名 + 英文副名。
+/// 窗口标题、托盘提示、系统通知的归属名都用它——只用中文，英文用户认不出；
+/// 只用英文，中文用户在一堆 exe 里认不出来。
+pub const APP_NAME: &str = "工作记录本 WorkLuLu";
+
 /// 巡检间隔。30 秒足够准时，又不会白耗电。
 const TICK: Duration = Duration::from_secs(30);
 /// 一次最多弹几条，避免积压了半个月的任务开机瞬间糊满屏幕
@@ -119,9 +124,9 @@ fn refresh_tray(app: &tauri::AppHandle) {
         let _ = tray.set_menu(Some(menu));
     }
     let tip = if pending > 0 {
-        format!("工作记录本 · {pending} 项待办")
+        format!("{APP_NAME} · {pending} 项待办")
     } else {
-        "工作记录本".to_string()
+        APP_NAME.to_string()
     };
     let _ = tray.set_tooltip(Some(tip.as_str()));
 }
@@ -293,7 +298,7 @@ fn main() {
             let menu = build_tray_menu(app.handle(), 0, true)?;
 
             let mut tray = TrayIconBuilder::with_id(TRAY_ID)
-                .tooltip("工作记录本")
+                .tooltip(APP_NAME)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, ev| match ev.id().as_ref() {
@@ -368,12 +373,18 @@ fn main() {
             commands::list_subtasks,
             commands::create_subtask,
             commands::rename_subtask,
+            commands::duplicate_task,
+            commands::list_templates,
+            commands::save_template,
+            commands::apply_template,
+            commands::delete_template,
             commands::skip_occurrence,
             commands::list_completions,
             commands::undo_completion,
             commands::get_settings,
             commands::set_setting,
             commands::data_dir,
+            commands::app_version,
             commands::open_data_dir,
             commands::backup_to,
             commands::restore_from,
