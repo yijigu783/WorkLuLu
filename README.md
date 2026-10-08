@@ -157,7 +157,7 @@
 
 ## 下载
 
-到 [Releases](../../releases) 页下载 `WorkLuLu-工作记录本-1.6.0.exe`，双击即可运行，不需要安装。
+到 [Releases](../../releases) 页下载 `WorkLuLu-工作记录本-1.6.1.exe`，双击即可运行，不需要安装。
 
 ## 数据在哪
 
@@ -195,7 +195,7 @@
 - Rust **1.77+**
 - MSVC 生成工具（VS 2022 Build Tools，勾选「使用 C++ 的桌面开发」+ Windows SDK）
 
-**不需要 Node.js、不需要 npm**。前端是原生的 HTML/CSS/JS，没有构建步骤，Tauri 直接把 `app/ui` 当静态资源打包。
+**构建不需要 Node.js、不需要 npm**。前端是原生的 HTML/CSS/JS，没有构建步骤，Tauri 直接把 `app/ui` 当静态资源打包。（下面「自检」那一节的脚本要用 Node 跑，但那是开发期的事，跟出包无关。）
 
 ### 构建
 
@@ -205,7 +205,18 @@ cd WorkLuLu/app/src-tauri
 cargo build --release
 ```
 
-产物在 `app/src-tauri/target/release/worklog.exe`，拷出来改成好认的名字就能用了。发布版命名为 `WorkLuLu-工作记录本-<版本号>.exe`，让人一眼看得出是哪一版（改版本号时要同时改 `Cargo.toml` 和 `tauri.conf.json`，两处不一致的话 exe 属性里会对不上）。
+产物在**仓库根**的 `target/release/worklog.exe`（这是 Cargo workspace，所有成员 crate 的产物统一落在根 target 下，不在 `app/src-tauri/target`），拷出来改成好认的名字就能用了。发布版命名为 `WorkLuLu-工作记录本-<版本号>.exe`，让人一眼看得出是哪一版。
+
+改版本号要同步 **4 处**，漏一处 exe 属性里就对不上：
+
+| 文件 | 位置 |
+| --- | --- |
+| `app/src-tauri/Cargo.toml` | `version` |
+| `app/src-tauri/tauri.conf.json` | `version` |
+| `app/ui/assets/app.js` | `APP_VERSION_FALLBACK`（关于页显示它） |
+| `README.md` | 「下载」段里的文件名 |
+
+（`Cargo.lock` 里 worklog 那条 cargo 会自己改，不用手动动。）
 
 ### 开发时看界面
 
@@ -222,21 +233,32 @@ node tools/make_preview.js today   out/ --modal=recurring.quarterly
 ## 项目结构
 
 ```
+core/                     三端共享业务层：数据模型 + 周期排期引擎
+                          纯计算，不碰数据库/文件/系统时钟，含单测
+data/                     三端共享数据访问层：建表、增量迁移、增删改查
+                          不依赖 tauri，库放哪儿由各端决定，含单测
 app/
-├── ui/                     前端（无框架、无打包器）
+├── ui/                   桌面端前端（无框架、无打包器）
 │   ├── index.html
 │   └── assets/{app.js, style.css}
-├── src-tauri/              Rust 后端
+├── src-tauri/            桌面端 Rust 后端
 │   ├── src/
-│   │   ├── main.rs         托盘、窗口、30 秒巡检线程
-│   │   ├── commands.rs     所有前端命令
-│   │   ├── db.rs           schema 与数据目录
-│   │   ├── schedule.rs     排期引擎（纯函数，含单测）
-│   │   └── notify.rs       Windows 通知与 AUMID 注册
+│   │   ├── main.rs       托盘、窗口、30 秒巡检线程
+│   │   ├── commands.rs   前端命令（薄包装：取锁 → 交给 data）
+│   │   ├── db.rs         数据目录与便携模式（桌面独有）
+│   │   ├── edge.rs       贴边自动隐藏
+│   │   ├── snap.rs       窗口吸附与几何
+│   │   ├── win32.rs      Win32 消息钩子
+│   │   ├── notify.rs     Windows 通知与 AUMID 注册
+│   │   └── single.rs     单实例
 │   └── tauri.conf.json
-└── tools/                  自检与预览脚本（Node）
-docs/                       截图与发布说明
+└── tools/                自检与预览脚本（Node）
+android/                  安卓端（骨架）
+docs/                     截图与发布说明
 ```
+
+排期算法和数据访问各自**只有一份实现**（`core/` 与 `data/`），桌面端和安卓端都依赖它们。
+各端各写一遍的话，同一个周期任务会在两端滚出不同的日期，而用户不会想到是端的问题。
 
 ## 技术栈
 
@@ -250,7 +272,7 @@ docs/                       截图与发布说明
 项目里带了一套防回归脚本，改完代码跑一遍：
 
 ```bash
-cargo test                              # 130 个单测（桌面版 107 + 共享 core 23），从仓库根跑
+cargo test                              # 130 个单测（桌面端 78 + 共享 data 29 + 共享 core 23），从仓库根跑
 cd app && node tools/check_ui.js        # 177 项渲染自检
 cd app && node tools/check_stats.js     # 8 项统计口径自检
 cd app && node tools/check_contract.js  # 四类契约差集：命令 / data-act / 事件 / 托盘菜单

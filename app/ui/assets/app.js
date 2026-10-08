@@ -6,7 +6,7 @@
  *  这里的 FALLBACK 只在浏览器预览模式（没有后端）下兜底。 */
 const APP_NAME_CN = '工作记录本';
 const APP_NAME_EN = 'WorkLuLu';
-const APP_VERSION_FALLBACK = '1.6.0';
+const APP_VERSION_FALLBACK = '1.6.1';
 const APP_COPYRIGHT = '© 2026 JJAI 制作';
 
 const PATTERNS = {

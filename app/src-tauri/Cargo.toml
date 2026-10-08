@@ -1,6 +1,6 @@
 [package]
 name = "worklog"
-version = "1.6.0"
+version = "1.6.1"
 description = "工作记录本 (WorkLuLu) - 单文件绿色的本地工作记录与周期排期工具"
 authors = ["JJAI"]
 edition = "2021"
