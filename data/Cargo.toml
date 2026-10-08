@@ -1,0 +1,25 @@
+[package]
+name = "worklog-data"
+# 与 core 一样，本 crate 不跟桌面版的版本号走 —— 它是三端共用的库，
+# 改动由调用方决定何时消费。桌面版和安卓版各自有自己的版本号。
+version = "0.1.0"
+description = "工作记录本 WorkLuLu 的跨端数据访问层"
+authors = ["JJAI"]
+edition = "2021"
+rust-version = "1.77"
+
+[dependencies]
+# bundled：把 SQLite 的 C 源码一起编进来，不依赖系统库。
+# 安卓上没有系统 SQLite 可用（有，但版本随 ROM 变，不能依赖），
+# bundled 是唯一能保证两端跑同一个 SQLite 的办法。
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+# 附件走 JSON 传递，二进制得先编成 base64 文本。
+# 这个 crate 本来就在依赖树里（tauri 间接用），显式声明不增加编译量。
+base64 = "0.22"
+
+# 排期引擎从共享层进来 —— 数据层要用它算周期任务的下一次执行时间。
+# **排期算法只有这一份实现**，见 core/src/lib.rs 顶部的三条纪律。
+worklog-core = { path = "../core" }

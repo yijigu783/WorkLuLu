@@ -30,6 +30,11 @@ base64 = "0.22"
 # 三端共享业务层（数据模型 + 周期排期引擎）。安卓版依赖同一个 crate，
 # 排期算法因此只有一份实现 —— 见 core/src/lib.rs 顶部的三条纪律。
 worklog-core = { path = "../../core" }
+# 三端共享数据访问层（建表 + 增量迁移 + 增删改查）。命令层只做「取锁 → 交给它」
+# 的薄包装，逻辑一行都不留在本 crate 里 —— 安卓版依赖同一个 crate。
+# 分开而不是塞进 core：core 有三条纪律（不依赖 tauri、不碰文件、不取系统时钟），
+# 数据层天生要违反后两条，硬塞进去会把 core 的规矩搞坏。
+worklog-data = { path = "../../data" }
 
 # schemars 0.8 (tauri 的间接依赖) 需要 indexmap 1.x。
 # indexmap 1.9.3 通过 autocfg 探测 std：探测失败时会退化成 no_std，

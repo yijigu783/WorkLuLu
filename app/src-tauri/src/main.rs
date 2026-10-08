@@ -467,7 +467,7 @@ mod tests {
 
     fn db() -> rusqlite::Connection {
         let c = rusqlite::Connection::open_in_memory().expect("内存库");
-        c.execute_batch(db::SCHEMA).expect("建表");
+        c.execute_batch(worklog_data::schema::SCHEMA).expect("建表");
         c
     }
 

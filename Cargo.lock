@@ -5173,6 +5173,7 @@ dependencies = [
  "tauri-winrt-notification",
  "windows",
  "worklog-core",
+ "worklog-data",
 ]
 
 [[package]]
@@ -5195,6 +5196,18 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "worklog-data"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "worklog-core",
 ]
 
 [[package]]

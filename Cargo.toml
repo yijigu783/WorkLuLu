@@ -10,13 +10,15 @@
 resolver = "2"
 members = [
     "core",
+    "data",
     "app/src-tauri",
     "android/src-tauri",
 ]
-# 日常验桌面版用 `cargo test`（默认只编这两个，快）。
+# 日常验桌面版用 `cargo test`（默认只编这几个，快）。
 # 安卓端编得慢，且多数改动跟它无关，要用时显式写 `cargo test --workspace`。
 default-members = [
     "core",
+    "data",
     "app/src-tauri",
 ]
 
