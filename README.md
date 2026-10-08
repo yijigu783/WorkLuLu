@@ -157,7 +157,10 @@
 
 ## 下载
 
-到 [Releases](../../releases) 页下载 `WorkLuLu-工作记录本-1.6.1.exe`，双击即可运行，不需要安装。
+到 [Releases](../../releases) 页下载 `WorkLuLu-1.6.1.exe`，双击即可运行，不需要安装。
+
+> 这个文件和仓库里构建出来的 `WorkLuLu-工作记录本-1.6.1.exe` 是**同一个**，
+> 只是 GitHub 的附件名不接受中文，所以发布时用了 ASCII 名。SHA-256 见 Release 说明。
 
 ## 数据在哪
 
