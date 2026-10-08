@@ -86,7 +86,7 @@ const ctx = {
 };
 vm.createContext(ctx);
 vm.runInContext(
-  body + '\n;globalThis.__api = { state, loadAll, taskRow, subtaskEditor, subtasksOf, descendantsOf, depthOf, canNest, subtreeIds, applySubtaskProgress, renderDrawer, renderBoard, renderCalendar, renderTemplates, renderSidebar, renderModal, renderSettings, openDayView, entriesOn, tasksOn, dayPreset, toLocalDate, laneOf, scopeTasks, bind, openEditor, syncEditorFields, ruleLabel, quarterMonths, dayText, nextOccurrence, defaultRuleFor, FREQS, stampName, MAX_DEPTH, APP_NAME_CN, APP_NAME_EN, APP_VERSION_FALLBACK, APP_COPYRIGHT };',
+  body + '\n;globalThis.__api = { state, loadAll, taskRow, subtaskEditor, subtasksOf, descendantsOf, depthOf, canNest, subtreeIds, applySubtaskProgress, renderDrawer, renderBoard, renderCalendar, renderTemplates, renderSidebar, renderModal, renderSettings, openDayView, entriesOn, tasksOn, dayPreset, toLocalDate, laneOf, scopeTasks, bind, openEditor, syncEditorFields, ruleLabel, quarterMonths, dayText, nextOccurrence, defaultRuleFor, FREQS, stampName, attFieldInner, attScopeList, attCard, attKey, fmtSize, extOf, viewCategoryId, MAX_DEPTH, APP_NAME_CN, APP_NAME_EN, APP_VERSION_FALLBACK, APP_COPYRIGHT };',
   ctx,
 );
 
@@ -374,6 +374,83 @@ vm.runInContext(
   ok('设置页仍然标着数据存放位置', /数据存放位置/.test(settings));
   ok('给用户看的不是数据库内部术语', !/VACUUM|ATTACH/.test(settings));
 
+  /* ---- 贴边自动隐藏的开关 ----
+     默认必须是关的：拖窗口贴边是很自然的动作，默认开的话每个人某天都会
+     遇到「窗口不见了」，而且看不出是自己拖出去造成的。
+     直接看渲染出来的开关样式，和前端 DEFAULT_OFF 的判定保持一致。 */
+  const edgeSwitch =
+    /<button class="switch([^"]*)" data-act="toggle-setting" data-key="edge"/.exec(settings);
+  ok('设置页有「贴边自动隐藏」开关', !!edgeSwitch);
+  ok('贴边隐藏默认关（默认开会让用户以为窗口丢了）',
+    !!edgeSwitch && !/on/.test(edgeSwitch[1]));
+  ok('旁边写清了怎么触发', /拖到屏幕左边缘或右边缘/.test(settings));
+
+  /* ---- 边缘分屏的开关 ----
+     这个和上面那个贴边隐藏抢同一条屏幕边，所以有三件事得盯住：
+     ① 开关在不在、默认是不是开（分屏是人人想要的手感，默认关等于白做）；
+     ② 三种落位（半屏 / 四分之一 / 最大化）在文案里说清楚了没有，
+        少说一种用户就永远不知道还有那种玩法；
+     ③ 互斥提示：两个开关同时指向同一条边时必须自己讲明白，
+        不然用户看到开关"自己跳回去"会当成 bug。 */
+  const snapSwitch =
+    /<button class="switch([^"]*)" data-act="toggle-setting" data-key="snap"/.exec(settings);
+  ok('设置页有「拖到屏幕边缘自动分屏」开关', !!snapSwitch);
+  ok('分屏默认开（分屏是人人想要的手感，默认关等于白做）',
+    !!snapSwitch && /on/.test(snapSwitch[1]));
+  ok('分屏文案讲清了三种落位',
+    /半屏/.test(settings) && /四分之一/.test(settings) && /最大化/.test(settings));
+
+  const saveSettings = (patch) => {
+    const keep = state.settings;
+    state.settings = { ...keep, ...patch };
+    const html = api.renderSettings();
+    state.settings = keep;
+    return html;
+  };
+  ok('分屏开着时提醒它和贴边隐藏二选一',
+    /只能留一个/.test(saveSettings({ snap: '1', edge: '0' })));
+  ok('贴边隐藏开着时也提醒它和分屏二选一',
+    /只能留一个/.test(saveSettings({ snap: '0', edge: '1' })));
+  ok('两个都关时不啰嗦互斥',
+    !/只能留一个/.test(saveSettings({ snap: '0', edge: '0' })));
+
+  /* ---- 便携模式 ----
+     「数据位置能不能自己定，想做成便携版」是使用反馈里的诉求。
+     这里盯四件事：徽标跟模式一致、按钮文案跟模式相反、目标位置有交代、
+     以及切不了的时候必须写出原因 —— 否则用户只会看到「点了没反应」。 */
+  const beforeInfo = state.dataInfo, beforePath = state.dataPath;
+  const withInfo = patch => {
+    state.dataInfo = {
+      path: state.dataPath, portable: false, portablePath: 'E:\\WorkLuLu\\data',
+      standardPath: state.dataPath, blocked: '', note: null, ...patch,
+    };
+    state.dataPath = state.dataInfo.path;
+    return api.renderSettings();
+  };
+
+  let set2 = withInfo({});
+  ok('标准模式下没有「便携」徽标', !/mode-chip/.test(set2));
+  ok('标准模式下按钮是「切为便携模式」',
+    set2.includes('切为便携模式') && !set2.includes('切回标准模式'));
+  ok('标准模式说明了数据在系统用户目录', /系统用户目录/.test(set2));
+  ok('切过去的目标位置挂在按钮 title 上', set2.includes('title="E:\\WorkLuLu\\data"'));
+
+  set2 = withInfo({ portable: true, path: 'E:\\WorkLuLu\\data' });
+  ok('便携模式下打出「便携」徽标', /mode-chip[^>]*>便携/.test(set2));
+  ok('便携模式下按钮反过来是「切回标准模式」',
+    set2.includes('切回标准模式') && !set2.includes('切为便携模式'));
+  ok('便携模式说明了数据在程序旁边、能拷走',
+    /data 文件夹/.test(set2) && /U 盘/.test(set2));
+  ok('徽标旁边显示的就是便携目录', /E:\\WorkLuLu\\data/.test(set2));
+  ok('便携模式下也能「打开目录」', set2.includes('data-act="open-data-dir"'));
+
+  set2 = withInfo({ blocked: '「C:\\Program Files\\x」写不进去' });
+  ok('切不了便携模式时把原因写出来，而不是点了没反应',
+    /切不了便携模式/.test(set2) && /Program Files/.test(set2));
+
+  state.dataInfo = beforeInfo;
+  state.dataPath = beforePath;
+
   /* ---- 关于 / 版权 ---- */
   ok('设置页有「关于」区块', /section-title">关于</.test(settings));
   ok('关于里同时挂着中英双名',
@@ -422,7 +499,7 @@ vm.runInContext(
     `${state.templates.length} 个`);
   ok('模板卡片写清有几件工作、几个条目', /件工作/.test(tplSrc) && /个条目/.test(tplSrc));
   ok('多层结构标出层数', /\d 层结构/.test(tplSrc));
-  ok('模板卡片有「新建一批」入口', /data-act="tpl-apply"/.test(tplSrc));
+  ok('模板卡片有「一键新建」入口', /data-act="tpl-apply"/.test(tplSrc));
   ok('模板卡片有删除入口', /data-act="tpl-del"/.test(tplSrc));
 
   // 这是整个模板设计的关键：存绝对日期的话，下个月调用就是一堆过期任务
@@ -441,11 +518,52 @@ vm.runInContext(
     ok('空模板库里不摆卡片', !/class="tpl-card"/.test(empty));
   }
 
+  /* ---- 主界面的「从模板新建」 ----
+     模板页要先切视图、再在卡片里找，对「这套流程今天就要走一遍」来说多了一步。
+     主界面这个入口就地列模板，挑完直接接基准日。 */
+  ok('主界面有「从模板」按钮', /id="btn-from-tpl"/.test(rawHtml));
+  ok('「从模板」按钮排在「新建工作」前面（先选已有的，再考虑新建）',
+    rawHtml.indexOf('id="btn-from-tpl"') < rawHtml.indexOf('id="btn-new"'));
+
+  state.tplPick = true;
+  api.renderModal();
+  const pickHtml = dom.modal.innerHTML;
+  state.tplPick = false;
+  ok('挑模板那一屏把模板全列出来',
+    (pickHtml.match(/class="tpl-pick"/g) || []).length === state.templates.length);
+  ok('整行可点，不用先选中再按一次确认',
+    /class="tpl-pick"[^>]*data-act="tpl-apply"/.test(pickHtml));
+  ok('挑模板时也写清有几件工作、几个条目（和模板页同一套口径）',
+    /件工作/.test(pickHtml) && /个条目/.test(pickHtml));
+  ok('挑模板那屏讲明后面还要选起算日', /起算的日子/.test(pickHtml));
+
+  // 空模板库时不能只给一个空列表 —— 用户不知道该去哪儿建
+  {
+    const bak = state.templates;
+    state.templates = [];
+    state.tplPick = true;
+    api.renderModal();
+    const emptyPick = dom.modal.innerHTML;
+    state.tplPick = false;
+    state.templates = bak;
+    ok('没有模板时挑模板那屏给出「怎么建」的指引', /存为模板/.test(emptyPick));
+    ok('没有模板时不列空行', !/class="tpl-pick"/.test(emptyPick));
+  }
+
   /* ---- 侧栏的模板入口 ---- */
   api.renderSidebar();
   const side = dom.get('sidebar').innerHTML;
   ok('侧栏有「模板」入口', /data-nav="tpl"/.test(side));
   ok('模板入口带模板数量', /data-nav="tpl"[\s\S]{0,200}?nav-count">\d+</.test(side));
+
+  /* ---- 主界面的赞赏入口 ----
+     用户要求把赞赏放到主界面，落在侧栏最下面一行。
+     但它是「感谢」不是「催收」：不能做成高亮按钮，且必须带自愿说明。 */
+  ok('主界面侧栏有赞赏入口', /class="side-reward"[^>]*data-act="open-reward"/.test(side));
+  ok('主界面赞赏入口带「自愿、不影响功能」的说明',
+    /title="[^"]*自愿[^"]*不影响任何功能/.test(side));
+  ok('赞赏入口不抢视线（没有 btn-primary 那种强调样式）',
+    !/btn-primary[^>]*data-act="open-reward"/.test(side));
 
   /* ---- 抽屉里的复制与存模板 ----
      放在最后跑：renderDrawer 会先把输入框里的内容收回 state，
@@ -456,14 +574,101 @@ vm.runInContext(
   ok('抽屉里有「复制一份」入口', /data-act="duplicate"/.test(drawer));
   ok('抽屉里有「存为模板」入口', /data-act="save-as-template"/.test(drawer));
   ok('抽屉说明了模板会连步骤一起存', /步骤一起存成模板/.test(drawer));
+
+  /* ---- 附件（粘贴的图片 / 上传的文件）----
+     这条是照着使用反馈做的：把跟别人的聊天截图直接粘进来留痕。
+     要点：入口得说清「可以粘贴」、图片走缩略图（列表不能背原图）、
+     非图片别硬塞成图片，以及没有附件时不留空网格。 */
+  state.drawerId = 1;                     // mock 里给这条挂了两个附件
+  api.renderDrawer();
+  const dAtt = dom.get('drawer').innerHTML;
+  ok('抽屉里有附件投放区', /class="att-zone"[^>]*data-att-zone="drawer"/.test(dAtt));
+  ok('投放区写明可以直接粘贴', /粘贴/.test(dAtt) && /Ctrl/.test(dAtt));
+  ok('投放区有「选择文件」入口', /data-act="att-pick"[^>]*data-scope="drawer"/.test(dAtt));
+  ok('附件逐条列出来', (dAtt.match(/class="att-card"/g) || []).length === 2, '2 个');
+  ok('图片附件走缩略图占位，不直接塞原图',
+    /<img class="att-thumb"[^>]*data-att-thumb="1"/.test(dAtt));
+  ok('非图片附件画成文件卡片，不塞 img',
+    /class="att-file"/.test(dAtt) && !/data-att-thumb="2"/.test(dAtt));
+  ok('附件名挂 title，长了能悬停看全', /class="att-name" title="[^"]+"/.test(dAtt));
+  ok('每个附件都有移除入口', (dAtt.match(/data-act="att-del"/g) || []).length === 2);
+
+  // 列表和看板上得看得出哪条有留痕，否则用户不逐条打开详情就不知道图存在哪
+  ok('列表行上标出「有留痕」',
+    /class="att-badge"[^>]*title="有 2 个附件/.test(api.taskRow(state.tasks.find(t => t.id === 1))));
+  ok('没有附件的工作不挂这个标记',
+    !/att-badge/.test(api.taskRow(state.tasks.find(t => t.id === 2))));
+
+  state.drawerId = stage.id;              // 这条没有附件
+  api.renderDrawer();
+  const dNone = dom.get('drawer').innerHTML;
+  ok('没有附件的工作不画空网格',
+    /class="att-zone"/.test(dNone) && !/class="att-grid"/.test(dNone));
   state.drawerId = null;
 
+  /* ---- 新建弹窗里的附件入口 ----
+     新建时工作还没入库，附件先在内存里攒着，保存成功后再一起入库。 */
+  api.openEditor(null);
+  const mAtt = dom.modal.innerHTML;
+  ok('新建弹窗里也有附件投放区', /id="att-field-modal"/.test(mAtt) && /data-att-zone="modal"/.test(mAtt));
+  ok('新建时附件先暂存，等保存再入库', Array.isArray(state.editing.atts));
+  state.editing = null;
+  api.renderModal();
+
+  /* ---- 附件展示口径 ---- */
+  ok('附件大小按量级显示',
+    api.fmtSize(184320) === '180 KB' && api.fmtSize(2048) === '2 KB' && api.fmtSize(0) === '',
+    `${api.fmtSize(184320)} / ${api.fmtSize(2048)}`);
+  ok('文件卡片显示的是扩展名', api.extOf('报价单.pdf') === 'PDF' && api.extOf('没有后缀') === '文件');
+  ok('暂存附件用临时 key，入库的用 id',
+    api.attKey({ pending: true, key: 'p3' }) === 'p3' && api.attKey({ id: 7 }) === '7');
+
+  state.drawerId = null;
+
+  /* ---- 在分类页里新建：分类自动带上 ----
+     使用反馈：站在「本职工作」里新建，还要再选一遍分类是多余的一步。 */
+  state.view = 'cat:2';                       // 副业
+  api.openEditor(null);
+  const catModal = dom.modal.innerHTML;
+  ok('在分类页新建时不再铺整排分类', !/class="cat-grid"/.test(catModal));
+  ok('分类自动带成当前分类',
+    /class="cat-fixed"/.test(catModal) && catModal.includes('副业'));
+  ok('新建的工作直接落在当前分类下', state.editing.categoryId === 2);
+  ok('留了「更改」的入口', /data-act="m-cat-open"/.test(catModal));
+
+  click({ dataset: { act: 'm-cat-open' } });
+  ok('点「更改」后铺开整排分类', /class="cat-grid"/.test(dom.modal.innerHTML));
+  state.editing = null; api.renderModal();
+
+  // 没有分类上下文的视图不能替用户做主
+  state.view = 'today';
+  api.openEditor(null);
+  ok('「今天」这类视图新建时仍让人选分类', /class="cat-grid"/.test(dom.modal.innerHTML));
+  state.editing = null; api.renderModal();
+
+  // 「未分类」页是明确地归到未分类，不是「没有上下文」
+  state.view = 'cat:none';
+  api.openEditor(null);
+  ok('在「未分类」页新建时归到未分类', state.editing.categoryId === null);
+  state.editing = null; api.renderModal();
+
+  // 分类页编辑已有工作时不受影响，仍然能改分类
+  state.view = 'cat:1';
+  api.openEditor(1);
+  ok('编辑已有工作时照常给分类选择', /class="cat-grid"/.test(dom.modal.innerHTML));
+  state.editing = null; api.renderModal();
+
+  ok('分类被删掉时退回让人选，不写不存在的 id',
+    (() => { const v = state.view; state.view = 'cat:999'; const r = api.viewCategoryId(); state.view = v; return r === undefined; })());
+
+  state.view = 'today';
+
   /* ---- 赞赏码 ----
-     入口刻意做得不起眼：藏在设置页「关于」最下面，和版本、版权信息并排。
+     两处入口：主界面侧栏最下面一行（按要求挪到主界面），以及设置页「关于」里。
      但几条底线得盯住 —— 图真打进去了、码够大扫得动、文案把性质说清楚了。
      另外原始海报上那行「xxx的赞赏码」不能出现：那个昵称和软件署名对不上，
      留在界面里会让用户怀疑码是不是被人换过。 */
-  ok('设置页「关于」里有赞赏入口', settings.includes('data-act="open-reward"'));
+  ok('设置页「关于」里也留着赞赏入口', settings.includes('data-act="open-reward"'));
 
   const qrPath = path.join(__dirname, '..', 'ui', 'assets', 'reward-qr.png');
   ok('赞赏码图片打进了前端资源', fs.existsSync(qrPath));
