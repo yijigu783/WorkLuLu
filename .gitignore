@@ -9,6 +9,7 @@
 # 安卓：Gradle 产物与本地配置
 /android/**/build/
 /android/**/.gradle/
+/android/**/.kotlin/
 /android/local.properties
 /android/**/keystore.properties
 *.jks
