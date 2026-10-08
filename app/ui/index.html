@@ -23,6 +23,13 @@
         </svg>
         <input id="search" type="text" placeholder="搜索工作记录…" autocomplete="off" spellcheck="false">
       </label>
+      <button class="btn btn-ghost" id="btn-from-tpl" title="从模板一键建出一整套工作和子任务">
+        <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
+          <rect x="5.5" y="2" width="8.5" height="8.5" rx="1.6"/>
+          <path d="M10.5 13.9H4.1a2.1 2.1 0 0 1-2.1-2.1V5.6"/>
+        </svg>
+        从模板
+      </button>
       <button class="btn btn-primary" id="btn-new">
         <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
           <path d="M8 3.5v9M3.5 8h9"/>
@@ -55,6 +62,9 @@
 <div class="modal-mask" id="modal-mask">
   <div class="modal" id="modal"></div>
 </div>
+
+<!-- 附件大图预览。点图片时铺满整屏看细节，点空白处或 Esc 关掉 -->
+<div class="lightbox" id="lightbox"></div>
 
 <script src="assets/app.js"></script>
 </body>

@@ -6,7 +6,7 @@
  *  这里的 FALLBACK 只在浏览器预览模式（没有后端）下兜底。 */
 const APP_NAME_CN = '工作记录本';
 const APP_NAME_EN = 'WorkLuLu';
-const APP_VERSION_FALLBACK = '1.2.0';
+const APP_VERSION_FALLBACK = '1.6.0';
 const APP_COPYRIGHT = '© 2026 JJAI 制作';
 
 const PATTERNS = {
@@ -149,20 +149,31 @@ const state = {
   subtasks: [],      // 阶段性工作拆出来的步骤（含子任务的子任务），不进主列表
   completions: [],   // 周期任务的完成记录
   templates: [],     // 模板库：把一套反复要用的结构存下来，下次一键重建
+  attachments: [],   // 附件的元信息（不含图片本体）。图片本体按需单独取
+  thumbCache: new Map(),  // 附件 id → 缩略图 data URL。抽屉每重绘一次都走一遍 IPC 太慢
+  lightbox: null,    // 正在看的大图：{ url, name }
+  attSeq: 0,         // 新建弹窗里暂存附件的临时编号（那时还没有数据库 id）
   settings: {},
   dataPath: '',
+  dataInfo: null,    // 数据存放位置：{ path, portable, portablePath, standardPath, blocked, note }
   appVersion: APP_VERSION_FALLBACK,
   q: '',
   drawerId: null,
   drawerRendered: null,  // 抽屉此刻渲染的是哪个任务：切走前要先收下没保存的输入
   editing: null,
   catEditing: null,
+  catPickerOpen: false,  // 新建时分类是自动带上的，这一行只显示一行；点「更改」才铺开整排
   dayView: null,     // 「这一天还有 N 项」弹窗正看着哪一天（YYYY-MM-DD）
   subAddFor: null,   // 正在给哪个子任务加下级：那一行会展开一个输入框
   ctxMenu: null,     // 日历上右键弹出的菜单：{ date, x, y }
   tplApplying: null, // 「从模板新建」正挑哪一天：{ id, name, items, base }
   tplSaving: null,   // 「存为模板」正起名字：{ taskId, name, steps }
+  tplPick: false,    // 主界面「从模板新建」正列着模板让人挑
   reward: false,     // 赞赏码弹窗开着没有
+  // 贴边隐藏的状态。判定在后端（它才拿得到鼠标绝对位置和显示器边界），
+  // 前端收到通知后只用来给收起时露出那条窄边上色，别的地方不要拿它做判断。
+  edgeCollapsed: false,
+  edgeSide: '',      // 'left' / 'right' / ''（没贴过边）
 };
 
 /* ---------------- API 层（Tauri / 浏览器预览双通道） ---------------- */
@@ -212,6 +223,35 @@ function defaultPathFor(name) {
 }
 
 const DB_FILTER = [{ name: '工作记录本备份', extensions: ['db'] }];
+
+/** 切换数据存放位置（标准 ↔ 便携）。
+ *
+ *  这一步真的会搬文件，所以先问一次，而且要把「搬什么、搬到哪」说清楚 ——
+ *  用户点了确定之后界面上路径会变，不提前说明会以为是程序出问题了。 */
+async function togglePortable() {
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  const i = state.dataInfo || {};
+  const toPortable = !i.portable;
+  const target = (toPortable ? i.portablePath : i.standardPath) || '（未知位置）';
+  const yes = await askDialog(
+    (toPortable
+      ? '把数据搬到程序旁边的 data 文件夹？\n\n数据会整体搬过去，不会丢。搬完之后，整个文件夹拷到 U 盘就能带走。'
+      : '把数据搬回系统的用户目录？\n\n数据会整体搬回去。之后程序文件可以随便挪位置，都不影响数据。')
+    + `\n\n目标位置：${target}`
+    + '\n\n切换前会自动留一份快照。',
+    '切换数据存放位置'
+  );
+  if (!yes) return;
+  try {
+    const msg = await inv('set_portable', { on: toPortable });
+    toast(msg || '已切换');
+    await loadAll();
+    renderView();
+  } catch (e) {
+    console.warn(e);
+    toast(String(e) || '切换失败');
+  }
+}
 
 async function backupNow() {
   if (!hasTauri) { toast('浏览器预览模式'); return; }
@@ -277,6 +317,22 @@ async function exportCsv() {
 }
 
 /* 浏览器预览用示例数据 */
+
+/** 预览里假装有一张聊天截图。真实的附件是粘贴进来的位图，这里用 SVG 顶一下，
+ *  好让附件区在 `make_preview.js` 生成的静态页里也能看到长什么样。 */
+function mockShot() {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="180" height="240">
+<rect width="180" height="240" fill="#F2F4F7"/>
+<rect x="12" y="14" width="118" height="24" rx="7" fill="#FFFFFF"/>
+<rect x="12" y="44" width="146" height="24" rx="7" fill="#FFFFFF"/>
+<rect x="48" y="74" width="118" height="24" rx="7" fill="#DCE9FF"/>
+<rect x="12" y="104" width="96" height="24" rx="7" fill="#FFFFFF"/>
+<rect x="48" y="134" width="118" height="24" rx="7" fill="#DCE9FF"/>
+<rect x="12" y="164" width="132" height="24" rx="7" fill="#FFFFFF"/>
+</svg>`;
+  return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+}
+
 function mockData() {
   const now = new Date();
   const at = (dOffset, h, m) => {
@@ -360,6 +416,13 @@ function mockData() {
         ],
       },
     ],
+    // 附件示例：一张「聊天截图」+ 一个文件。预览里能看到附件区长什么样
+    attachments: [
+      { id: 1, taskId: 1, name: '和甲方的沟通记录.png', mime: 'image/png', size: 184320,
+        kind: 'image', hasThumb: true, createdAt: at(-1, 15), url: mockShot() },
+      { id: 2, taskId: 1, name: '报价单.pdf', mime: 'application/pdf', size: 98304,
+        kind: 'file', hasThumb: false, createdAt: at(-1, 15) },
+    ],
     // 半年的周期完成记录，让热力图和趋势图在预览里有东西可看
     completions: (() => {
       const src = [
@@ -396,20 +459,24 @@ function mockData() {
 async function loadAll() {
   if (hasTauri) {
     try {
-      const [categories, tasks, settings, dataPath, completions, subtasks, templates, version] = await Promise.all([
+      const [categories, tasks, settings, dataInfo, completions, subtasks, templates, version, attachments] = await Promise.all([
         inv('list_categories'), inv('list_tasks'), inv('get_settings'),
-        inv('data_dir'), inv('list_completions', { limit: 1000 }), inv('list_subtasks'),
+        inv('data_info'), inv('list_completions', { limit: 1000 }), inv('list_subtasks'),
         inv('list_templates'),
         // 版本号只影响「关于」那几行字，读不到也不该把整次加载带崩
         inv('app_version').catch(() => APP_VERSION_FALLBACK),
+        // 附件的元信息很小，一次拿全，列表/看板上的「有附件」标记就不用再逐条问
+        inv('list_attachments').catch(() => []),
       ]);
       state.categories = categories;
       state.tasks = tasks;
       state.settings = settings || {};
-      state.dataPath = dataPath;
+      state.dataInfo = dataInfo || null;
+      state.dataPath = (dataInfo && dataInfo.path) || '';
       state.completions = completions || [];
       state.subtasks = subtasks || [];
       state.templates = templates || [];
+      state.attachments = attachments || [];
       state.appVersion = version || APP_VERSION_FALLBACK;
       applySubtaskProgress();
       return;
@@ -421,8 +488,17 @@ async function loadAll() {
   state.completions = m.completions;
   state.subtasks = m.subtasks || [];
   state.templates = m.templates || [];
+  state.attachments = m.attachments || [];
   state.settings = {};
   state.dataPath = 'C:\\Users\\<你>\\AppData\\Roaming\\工作记录本';
+  state.dataInfo = {
+    path: state.dataPath,
+    portable: false,
+    portablePath: 'D:\\WorkLuLu\\data',
+    standardPath: state.dataPath,
+    blocked: '',
+    note: null,
+  };
   state.appVersion = APP_VERSION_FALLBACK;
   applySubtaskProgress();
 }
@@ -610,6 +686,13 @@ function renderSidebar() {
       ${navItem('tpl', '模板', '#0EA5E9', state.templates.length || '')}
       ${navItem('stats', '统计看板', '#8B5CF6', '')}
       ${navItem('settings', '设置', '#94A3B8', '')}
+      <button class="side-reward" data-act="open-reward"
+              title="软件免费使用；赞赏纯属自愿，不影响任何功能">
+        <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M8 13.2S2.6 10 2.6 6.4A2.9 2.9 0 0 1 8 4.9a2.9 2.9 0 0 1 5.4 1.5c0 3.6-5.4 6.8-5.4 6.8z"/>
+        </svg>
+        <span>赞赏支持</span>
+      </button>
     </div>`;
 }
 
@@ -653,7 +736,7 @@ function taskRow(t) {
       <span class="pattern-bar ${p.bar}"></span>
       <div class="task-main" data-act="open" data-id="${t.id}">
         <div class="task-title">${hl(t.title)}</div>
-        <div class="task-meta">${overdue ? `<span class="overdue">${metaLabel(t, cat)}</span>` : metaLabel(t, cat)}</div>
+        <div class="task-meta">${overdue ? `<span class="overdue">${metaLabel(t, cat)}</span>` : metaLabel(t, cat)}${attBadge(t.id)}</div>
         ${note ? `<div class="task-note" title="${escAttr(note)}">${hl(note)}</div>` : ''}
       </div>
       ${prog}
@@ -831,6 +914,25 @@ function scopeTasks() {
   return list;   // 'all' 就是全部，不再筛
 }
 
+/** 当前视图隐含的分类。
+ *
+ *  - 分类页 → 那个分类的 id
+ *  - 「未分类」页 → null
+ *  - 其它视图（今天 / 全部 / 已完成 / 设置）→ undefined，表示**没有上下文**
+ *
+ *  区分 null 和 undefined 是有意的：null 是「明确地属于未分类」，
+ *  undefined 是「这个视图压根不涉及分类」。新建工作时两者处理方式不同。
+ *  分类被删掉（数据从别处改过）时也返回 undefined —— 宁可退回让人选，也不要写进一个不存在的 id。 */
+function viewCategoryId() {
+  const v = state.view || '';
+  if (v === 'cat:none') return null;
+  if (v.startsWith('cat:')) {
+    const id = Number(v.slice(4));
+    return catById(id) ? id : undefined;
+  }
+  return undefined;
+}
+
 /** 主区右上角的「列表 / 看板 / 日历」开关。
  *  用 DOM 挂上去而不是拼进字符串：各视图的页头结构不完全一样，
  *  硬要插进去就得挨个改 render 函数，不值当。 */
@@ -886,7 +988,7 @@ function boardCard(t) {
       <span class="pattern-bar ${p.bar}"></span>
       <div class="board-card-body">
         <div class="board-card-title">${hl(t.title)}</div>
-        <div class="board-card-meta">${esc(meta)}</div>
+        <div class="board-card-meta">${esc(meta)}${attBadge(t.id)}</div>
         ${note ? `<div class="board-card-note" title="${escAttr(note)}">${hl(note)}</div>` : ''}
         ${prog}
       </div>
@@ -1029,40 +1131,44 @@ function renderCalendar() {
 
 /* ---------------- 模板库：把一套结构存下来，下次一键重建 ---------------- */
 
+/** 模板卡片上那行摘要：几件工作、要不要分层、跨度多少天。
+ *  模板页和主界面的「从模板新建」共用 —— 两处各写一份，
+ *  迟早会出现同一个模板两种说法。 */
+function tplMeta(t) {
+  const items = t.items || [];
+  const top = items.filter(i => i.parentId == null).length;
+  const offs = items.map(i => i.dueOffset).filter(v => v != null);
+  const span = offs.length ? `跨度 ${Math.min(0, ...offs)} – ${Math.max(0, ...offs)} 天` : '';
+  // 最深到第几层：模板里存的下级关系看不出深浅，得算一遍才说得清
+  const byId = new Map(items.map(i => [i.id, i]));
+  const depth = items.reduce((mx, i) => {
+    let d = 1, cur = i;
+    while (cur && cur.parentId != null && d < 64) { d++; cur = byId.get(cur.parentId); }
+    return Math.max(mx, d);
+  }, 0);
+
+  return [
+    `${top} 件工作`,
+    depth > 1 ? `${depth} 层结构` : '',
+    `${items.length} 个条目`,
+    span,
+  ].filter(Boolean).join(' · ');
+}
+
 function renderTemplates() {
   const list = state.templates || [];
 
-  const cards = list.map(t => {
-    const top = t.items.filter(i => i.parentId == null).length;
-    const offs = t.items.map(i => i.dueOffset).filter(v => v != null);
-    const span = offs.length ? `跨度 ${Math.min(0, ...offs)} – ${Math.max(0, ...offs)} 天` : '';
-    // 最深到第几层：模板里存的下级关系看不出深浅，得算一遍才说得清
-    const byId = new Map(t.items.map(i => [i.id, i]));
-    const depth = t.items.reduce((mx, i) => {
-      let d = 1, cur = i;
-      while (cur && cur.parentId != null && d < 64) { d++; cur = byId.get(cur.parentId); }
-      return Math.max(mx, d);
-    }, 0);
-
-    const meta = [
-      `${top} 件工作`,
-      depth > 1 ? `${depth} 层结构` : '',
-      `${t.items.length} 个条目`,
-      span,
-    ].filter(Boolean).join(' · ');
-
-    return `
+  const cards = list.map(t => `
       <div class="tpl-card">
         <div class="tpl-main">
           <div class="tpl-name">${esc(t.name)}</div>
-          <div class="tpl-meta">${esc(meta)}</div>
+          <div class="tpl-meta">${esc(tplMeta(t))}</div>
         </div>
         <div class="tpl-actions">
-          <button class="btn btn-primary" data-act="tpl-apply" data-id="${t.id}">新建一批</button>
+          <button class="btn btn-primary" data-act="tpl-apply" data-id="${t.id}">一键新建</button>
           <button class="btn btn-danger-ghost" data-act="tpl-del" data-id="${t.id}">删除</button>
         </div>
-      </div>`;
-  }).join('');
+      </div>`).join('');
 
   return `
     <div class="view-head">
@@ -1379,14 +1485,19 @@ const SETTING_ITEMS = [
   { key: 'autostart', title: '开机自动启动', desc: '登录 Windows 后在托盘静默启动。默认不开，需要它常驻后台时再打开' },
   { key: 'notify',    title: '到期提醒',     desc: '任务到期时弹出系统通知' },
   { key: 'tray',      title: '关闭窗口时最小化到托盘', desc: '关闭后继续在后台运行，保证提醒准时' },
+  { key: 'snap',      title: '拖到屏幕边缘自动分屏', desc: '拖到左/右边缘变半屏，拖到左上/右上角变四分之一，拖到顶边最大化' },
+  { key: 'edge',      title: '贴边自动隐藏', desc: '把窗口拖到屏幕左边缘或右边缘，它会滑到一边只留一条窄边；鼠标碰一下再滑回来' },
 ];
 
 /** 默认是「关」的开关。
  *  用户没动过设置时，其余开关默认开（它们只是程序内部的行为）；
- *  唯独开机自启必须默认关 —— 它要往系统里写启动项，
+ *  开机自启必须默认关 —— 它要往系统里写启动项，
  *  不该在用户没明确同意的情况下替他做这个决定。
- *  这也是杀软行为引擎最敏感的动作之一，少写一次就少一分被误报的理由。 */
-const DEFAULT_OFF = { autostart: true };
+ *  这也是杀软行为引擎最敏感的动作之一，少写一次就少一分被误报的理由。
+ *
+ *  贴边隐藏同样默认关：拖窗口贴边是很自然的动作，
+ *  默认开的话每个人某天都会遇到「窗口不见了」，而且看不出是自己拖出去造成的。 */
+const DEFAULT_OFF = { autostart: true, edge: true };
 
 function settingOn(key) {
   const v = state.settings?.[key];
@@ -1399,8 +1510,49 @@ function settingOn(key) {
  *  用户关掉开机自启后，很自然会以为「提醒还开着 = 到点会响」，这里得拦住这个误会。 */
 function settingHint(s) {
   const needsBackground = s.key === 'notify' && settingOn('notify') && !settingOn('autostart');
-  if (!needsBackground) return '';
-  return `<div class="task-meta warn-text">提醒要靠程序在后台跑着才发得出来。没开开机自启，重启电脑后就收不到提醒了。</div>`;
+  if (needsBackground) {
+    return `<div class="task-meta warn-text">提醒要靠程序在后台跑着才发得出来。没开开机自启，重启电脑后就收不到提醒了。</div>`;
+  }
+  // 贴边隐藏和边缘分屏抢的是同两条边：窗口拖到左边到底是「摆半屏」还是「藏起来」，
+  // 只能有一个说了算。谁被打开，另一个就被关掉，这里把这个连带关系讲明白，
+  // 否则用户会看到开关自己跳回去了，还以为程序出 bug。
+  if (s.key === 'snap' && settingOn('edge')) {
+    return `<div class="task-meta warn-text">和「贴边自动隐藏」只能留一个：它们盯的是同一条屏幕边。打开分屏，贴边隐藏会自动关掉。</div>`;
+  }
+  if (s.key === 'edge' && settingOn('snap')) {
+    return `<div class="task-meta warn-text">和「拖到屏幕边缘自动分屏」只能留一个：它们盯的是同一条屏幕边。打开贴边隐藏，分屏会自动关掉。</div>`;
+  }
+  return '';
+}
+
+/** 「数据存放位置」这张卡片。
+ *
+ *  便携模式的两条触发（exe 旁的 portable.txt，或一个名为 data 的目录）判定在后端，
+ *  这里只负责把话讲明白：现在存哪儿、怎么切、切了会发生什么、以及切不了的理由。
+ *
+ *  `blocked` 非空时必须显眼 —— exe 放在 Program Files 这类只读位置时给不出便携模式，
+ *  不写清楚的话用户只会看到「点了没反应」。 */
+function portableCard() {
+  const i = state.dataInfo || {};
+  const portable = !!i.portable;
+  const blocked = i.blocked || '';
+  const target = (portable ? i.standardPath : i.portablePath) || '';
+  const path = state.dataPath || '（还没读到，点「打开目录」试试）';
+  return `
+      <div class="task" style="padding:14px">
+        <div class="task-main">
+          <div class="task-title">数据存放位置${portable ? '<span class="mode-chip">便携</span>' : ''}</div>
+          <div class="task-meta path-line">${esc(path)}</div>
+          <div class="task-meta">${portable
+            ? '数据就在程序旁边的 data 文件夹里，整个文件夹拷到 U 盘就能带走。'
+            : '数据存在系统用户目录，程序文件可以随便挪位置、覆盖升级都不影响。'}</div>
+          ${blocked ? `<div class="task-meta warn-text">这里切不了便携模式：${esc(blocked)}</div>` : ''}
+        </div>
+        <div class="task-acts">
+          <button class="btn btn-ghost" data-act="open-data-dir">打开目录</button>
+          <button class="btn btn-ghost" data-act="toggle-portable" title="${escAttr(target)}">${portable ? '切回标准模式' : '切为便携模式'}</button>
+        </div>
+      </div>`;
 }
 
 function renderSettings() {
@@ -1447,13 +1599,7 @@ function renderSettings() {
         </div>
         <button class="btn btn-ghost" data-act="export-csv">导出 CSV</button>
       </div>
-      <div class="task" style="padding:14px">
-        <div class="task-main">
-          <div class="task-title">数据存放位置</div>
-          <div class="task-meta">${esc(state.dataPath || '本机用户目录 / worklog.db')}</div>
-        </div>
-        <button class="btn btn-ghost" data-act="open-data-dir">打开目录</button>
-      </div>
+      ${portableCard()}
     </div>
 
     <div class="section-head" style="margin-top:22px">
@@ -1495,6 +1641,397 @@ function renderView() {
   el.innerHTML = html;
   if (!plain) mountViewSwitch();
   el.scrollTop = 0;
+}
+
+/* ---------------- 附件：粘贴图片 / 上传文件 ----------------
+ *
+ *  场景来自使用反馈：把跟别人的聊天截图直接粘进来留痕。
+ *
+ *  三条约定：
+ *  1. 图片本体存进数据库（见 commands.rs 的 attachments 表），所以备份仍然是
+ *     「一个 .db 拷走就是全部」，恢复、便携模式都不用改。
+ *  2. 列表只取缩略图，原图等点开才取 —— 否则抽屉一打开就要搬几十 MB。
+ *  3. 粘贴进来的图片先压一道再送后端：聊天截图动辄好几 MB，原样入库会让库
+ *     和备份文件一起失控。压缩在 canvas 里做，不走后端，粘完立刻能看到。
+ */
+
+/** 与后端 MAX_ATTACHMENT_BYTES 同一口径 */
+const MAX_ATT_BYTES = 20 * 1024 * 1024;
+/** 原图最长边上限。够看清聊天记录里的字，又不至于把库撑起来 */
+const IMG_MAX_EDGE = 2200;
+/** 列表缩略图的最长边 */
+const ATT_THUMB_EDGE = 360;
+
+/** 抽屉 / 弹窗此刻能往哪儿加附件。弹窗压在最上面，所以它优先。 */
+function currentAttScope() {
+  if (state.editing) return 'modal';
+  if (state.drawerId) return 'drawer';
+  return null;
+}
+
+/** 某个作用域此刻该显示哪些附件。
+ *  弹窗里编辑一条**已存在**的工作时直接用库里那份，不用另存一份列表。 */
+function attScopeList(scope) {
+  if (scope === 'modal') {
+    const e = state.editing;
+    if (!e) return [];
+    return e.id ? state.attachments.filter(a => a.taskId === e.id) : (e.atts || []);
+  }
+  if (!state.drawerId) return [];
+  return state.attachments.filter(a => a.taskId === state.drawerId);
+}
+
+/** 一个附件在界面上的唯一标识：已入库的用 id，暂存的用临时 key */
+const attKey = a => (a.pending ? a.key : String(a.id));
+
+function findAtt(scope, key) {
+  return attScopeList(scope).find(a => attKey(a) === key) || null;
+}
+
+/** 这条工作挂了几张图 / 几个文件。0 表示没有，界面就不显示这个标记。 */
+const attCountOf = taskId => state.attachments.filter(a => a.taskId === taskId).length;
+
+/** 列表和看板上那个「有留痕」的小标记。
+ *  没有它的话，用户不逐条打开详情就不知道哪条存了截图 —— 留痕的价值有一半在「找得到」。 */
+function attBadge(taskId) {
+  const n = attCountOf(taskId);
+  if (!n) return '';
+  return `<span class="att-badge" title="有 ${n} 个附件（截图 / 文件）">`
+       + '<svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" '
+       + 'stroke-linecap="round" stroke-linejoin="round">'
+       + '<path d="M11.4 6.1 7.2 10.3a2.4 2.4 0 0 1-3.4-3.4l4.6-4.6a1.7 1.7 0 0 1 2.4 2.4l-4.6 4.6a.9.9 0 0 1-1.3-1.3l4-4"/></svg>'
+       + `${n}</span>`;
+}
+
+/** 只把列表行 / 看板卡上那条「有留痕」小标记改掉，不重画整屏。
+ *  renderView 会把主区滚回顶部，用户正开着详情抽屉删附件时那一下很讨厌，
+ *  而这里真正变的只有那个数字。 */
+function refreshAttBadge(taskId) {
+  const rows = document.querySelectorAll(
+    `.task[data-id="${taskId}"], .board-card[data-id="${taskId}"]`);
+  if (!rows || !rows.length) return;
+  const want = attCountOf(taskId);
+  for (const row of rows) {
+    const meta = row.querySelector('.task-meta') || row.querySelector('.board-card-meta');
+    if (!meta) continue;
+    const old = meta.querySelector('.att-badge');
+    if (old) old.remove();
+    if (want) meta.insertAdjacentHTML('beforeend', attBadge(taskId));
+  }
+}
+
+function fmtSize(n) {
+  if (!n) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function extOf(name) {
+  const m = /\.([A-Za-z0-9]{1,5})$/.exec(name || '');
+  return m ? m[1].toUpperCase() : '文件';
+}
+
+function attCard(a, scope) {
+  const isImg = a.kind === 'image';
+  const key = attKey(a);
+  // 已入库的图片第一次渲染时缩略图还没取回来，先留空，由 hydrateThumbs 补上
+  const cached = a.url || (!a.pending ? state.thumbCache.get(a.id) : '') || '';
+  const body = isImg
+    ? `<img class="att-thumb" alt=""${cached ? ` src="${cached}"` : ''}${a.pending ? '' : ` data-att-thumb="${a.id}"`}>`
+    : `<span class="att-file"><b>${esc(extOf(a.name))}</b></span>`;
+  const tip = `${a.name}${a.size ? ' · ' + fmtSize(a.size) : ''}`;
+  return `
+    <div class="att-card">
+      <button class="att-hit" data-act="att-open" data-scope="${scope}"
+              data-key="${key}" title="${escAttr(tip)}${isImg ? '（点开看大图）' : '（用系统程序打开）'}">${body}</button>
+      <span class="att-name" title="${escAttr(tip)}">${esc(a.name)}</span>
+      <button class="att-del" data-act="att-del" data-scope="${scope}" data-key="${key}" title="移除">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
+      </button>
+    </div>`;
+}
+
+function attFieldInner(scope) {
+  const list = attScopeList(scope);
+  return `
+    <div class="field-label">附件${list.length ? `<span class="sub-progress">${list.length}</span>` : ''}</div>
+    <div class="att-zone" data-att-zone="${scope}">
+      <div class="att-zone-main">
+        <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M8 10.6V2.4M5.2 5.2 8 2.4l2.8 2.8"/><path d="M2.4 10.4v2.2a1 1 0 0 0 1 1h9.2a1 1 0 0 0 1-1v-2.2"/>
+        </svg>
+        <span>把聊天截图<kbd>Ctrl</kbd>+<kbd>V</kbd> 直接粘贴进来，或把文件拖到这里</span>
+      </div>
+      <button class="btn btn-ghost" data-act="att-pick" data-scope="${scope}">选择文件</button>
+    </div>
+    ${list.length ? `<div class="att-grid">${list.map(a => attCard(a, scope)).join('')}</div>` : ''}`;
+}
+
+/** 只重绘附件这一块。整块重绘弹窗会把用户敲了一半的表单冲掉，
+ *  抽屉重绘则会把滚动位置带跑，为加一张图不值当。 */
+function rerenderAttScope(scope) {
+  const el = document.getElementById(scope === 'modal' ? 'att-field-modal' : 'att-field-drawer');
+  if (el) el.innerHTML = attFieldInner(scope);
+  hydrateThumbs(scope);
+}
+
+/** 把还没取回来的缩略图补上。已经取过的走 thumbCache，不重复走 IPC。 */
+async function hydrateThumbs(scope) {
+  if (!hasTauri) return;
+  for (const a of attScopeList(scope)) {
+    if (a.pending || !a.hasThumb || state.thumbCache.has(a.id)) continue;
+    if (!document.querySelector(`img[data-att-thumb="${a.id}"]`)) continue;
+    try {
+      const url = await inv('get_attachment', { id: a.id, thumb: true });
+      state.thumbCache.set(a.id, url);
+      // 取图期间界面可能已经重绘过，重新查一次再赋值，别写进已经作废的节点
+      const img = document.querySelector(`img[data-att-thumb="${a.id}"]`);
+      if (img) img.src = url;
+    } catch (e) { console.warn(e); }
+  }
+}
+
+/* ---- 采集：粘贴 / 拖拽 / 选文件 ---- */
+
+function pickFiles(scope) {
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.multiple = true;
+  input.style.display = 'none';
+  document.body.appendChild(input);
+  input.addEventListener('change', () => {
+    const files = Array.from(input.files || []);
+    input.remove();
+    handleFiles(files, scope);
+  });
+  input.click();
+}
+
+async function handleFiles(files, scope) {
+  const list = (files || []).filter(Boolean);
+  if (!list.length) return;
+  let ok = 0;
+  for (const f of list) {
+    try { await addOneFile(f, scope); ok++; }
+    catch (e) { console.warn(e); toast((e && e.message) || '这个文件加不进来'); }
+  }
+  if (ok) toast(ok === 1 ? '已添加附件' : `已添加 ${ok} 个附件`);
+}
+
+async function addOneFile(file, scope) {
+  const isImg = (file.type || '').startsWith('image/');
+  let payload;
+  if (isImg) {
+    payload = await prepareImage(file);
+  } else {
+    if (file.size > MAX_ATT_BYTES) {
+      throw new Error(`单个附件不能超过 ${MAX_ATT_BYTES / 1024 / 1024} MB`);
+    }
+    const dataB64 = await readAsBase64(file);
+    if (!dataB64) throw new Error('这个文件是空的');
+    payload = {
+      name: file.name || '未命名文件',
+      mime: file.type || 'application/octet-stream',
+      dataB64, thumbB64: null, size: file.size,
+    };
+  }
+
+  const meta = {
+    name: payload.name, mime: payload.mime, size: payload.size,
+    kind: isImg ? 'image' : 'file', hasThumb: !!payload.thumbB64,
+  };
+
+  // 新建弹窗里这条工作还没建出来，先在内存里放着，保存时再一起入库
+  if (scope === 'modal' && !state.editing?.id) {
+    state.editing.atts = state.editing.atts || [];
+    state.editing.atts.push(Object.assign({}, meta, {
+      key: 'p' + (++state.attSeq),
+      pending: true,
+      url: payload.thumbB64 ? `data:image/jpeg;base64,${payload.thumbB64}` : null,
+      dataB64: payload.dataB64,
+      thumbB64: payload.thumbB64,
+    }));
+    rerenderAttScope(scope);
+    return;
+  }
+
+  const taskId = scope === 'modal' ? state.editing.id : state.drawerId;
+  if (!taskId) throw new Error('先保存这条工作，再添加附件');
+
+  // 浏览器预览（make_preview 生成的静态副本）没有后端可存，就地挂在内存里，
+  // 好让预览能把整个流程演示出来。和 toggleTask / saveModal 里的预览分支一个路子。
+  if (!hasTauri) {
+    state.attachments.push(Object.assign({}, meta, {
+      id: -(state.attachments.length + 1),
+      taskId,
+      url: payload.thumbB64 ? `data:image/jpeg;base64,${payload.thumbB64}` : null,
+    }));
+    rerenderAttScope(scope);
+    refreshAttBadge(taskId);
+    return;
+  }
+
+  const saved = await inv('add_attachment', {
+    taskId, name: meta.name, mime: meta.mime, kind: meta.kind,
+    data: payload.dataB64, thumb: payload.thumbB64,
+  });
+  state.attachments.push(saved);
+  // 刚生成的缩略图直接进缓存，省一次往返
+  if (payload.thumbB64) state.thumbCache.set(saved.id, `data:image/jpeg;base64,${payload.thumbB64}`);
+  rerenderAttScope(scope);
+  // 列表行上的「有留痕」标记要跟着涨。只改那个标记，不动抽屉 ——
+  // 抽屉刚操作过，整块重画会把用户正在写的标题/备注冲掉
+  refreshAttBadge(taskId);
+}
+
+/** 新建保存后把暂存的附件补进库。失败一个不影响其余，也不影响工作本身已经建好 */
+async function flushPendingAttachments(taskId) {
+  const pend = ((state.editing && state.editing.atts) || []).filter(a => a.pending);
+  for (const a of pend) {
+    try {
+      const saved = await inv('add_attachment', {
+        taskId, name: a.name, mime: a.mime, kind: a.kind, data: a.dataB64, thumb: a.thumbB64,
+      });
+      state.attachments.push(saved);
+      if (a.thumbB64) state.thumbCache.set(saved.id, `data:image/jpeg;base64,${a.thumbB64}`);
+    } catch (e) {
+      console.warn(e);
+      toast(`附件「${a.name}」没能存上，其余照常`);
+    }
+  }
+}
+
+/* ---- 图片压缩：在 canvas 里做，不经过后端 ---- */
+
+function readAsBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(',')[1] || '');
+    r.onerror = () => rej(new Error('读文件失败'));
+    r.readAsDataURL(file);
+  });
+}
+
+function loadBitmap(file) {
+  if (typeof createImageBitmap === 'function') return createImageBitmap(file);
+  // 兜底：老 WebView 没有 createImageBitmap
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => res(img);
+    img.onerror = () => rej(new Error('这张图读不出来'));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+/** 等比缩到最长边不超过 maxEdge；本来就够小就原样返回，不做无谓的重采样 */
+function drawScaled(src, maxEdge) {
+  const w = src.width, h = src.height;
+  const scale = Math.min(1, maxEdge / Math.max(w, h));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w * scale));
+  c.height = Math.max(1, Math.round(h * scale));
+  const ctx = c.getContext('2d');
+  ctx.drawImage(src, 0, 0, c.width, c.height);
+  return c;
+}
+
+function stampShort() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/** 把粘贴/选中的图片压成「原图 + 缩略图」两份 base64。
+ *
+ *  原图优先用 PNG：聊天截图里全是文字，JPEG 的块效应会把字糊掉，而留痕最要紧的
+ *  就是字还认不认得出。只有 PNG 压完仍然很大（长截图、照片）才退一步用 JPEG。 */
+async function prepareImage(file) {
+  const bmp = await loadBitmap(file);
+  const full = drawScaled(bmp, IMG_MAX_EDGE);
+
+  let mime = 'image/png';
+  let dataUrl = full.toDataURL('image/png');
+  if (dataUrl.length > 4 * 1024 * 1024) {
+    mime = 'image/jpeg';
+    dataUrl = full.toDataURL('image/jpeg', 0.9);
+  }
+  const thumbUrl = drawScaled(bmp, ATT_THUMB_EDGE).toDataURL('image/jpeg', 0.8);
+  if (typeof bmp.close === 'function') bmp.close();
+
+  const name = file.name || `粘贴图片-${stampShort()}.${mime === 'image/png' ? 'png' : 'jpg'}`;
+  return {
+    name,
+    mime,
+    dataB64: dataUrl.split(',')[1] || '',
+    thumbB64: thumbUrl.split(',')[1] || '',
+    // 压缩后的大小：base64 每 4 个字符还原 3 个字节，减掉填充误差即可
+    size: Math.round((dataUrl.length - dataUrl.indexOf(',') - 1) * 3 / 4),
+  };
+}
+
+/* ---- 单个附件的操作 ---- */
+
+async function viewAttachment(a) {
+  try {
+    let url = a.url;
+    if (!url) {
+      if (a.pending) url = `data:${a.mime};base64,${a.dataB64}`;
+      else if (hasTauri) url = await inv('get_attachment', { id: a.id, thumb: false });
+    }
+    if (!url) { toast('浏览器预览模式'); return; }
+    state.lightbox = { url, name: a.name };
+    renderLightbox();
+  } catch (e) {
+    console.warn(e);
+    toast('这张图打不开了');
+  }
+}
+
+/** 点附件：图片铺满整屏看细节，其他文件交给系统默认程序。
+ *  两件事共用一个入口（`att-open`），是因为界面上的动作本来就只有一个「点开」。 */
+async function openAttachment(a) {
+  if (a.kind === 'image') return viewAttachment(a);
+  if (a.pending) { toast('保存这条工作后就能打开'); return; }
+  if (!hasTauri) { toast('浏览器预览模式'); return; }
+  try { await inv('open_attachment', { id: a.id }); }
+  catch (e) { console.warn(e); toast('打不开这个文件'); }
+}
+
+async function deleteAttachment(a, scope) {
+  if (a.pending) {
+    const list = state.editing?.atts || [];
+    const i = list.findIndex(x => x.key === a.key);
+    if (i >= 0) list.splice(i, 1);
+    rerenderAttScope(scope);
+    return;
+  }
+  if (hasTauri) {
+    try { await inv('delete_attachment', { id: a.id }); }
+    catch (e) { console.warn(e); toast('删除失败'); return; }
+  }
+  state.attachments = state.attachments.filter(x => x.id !== a.id);
+  state.thumbCache.delete(a.id);
+  rerenderAttScope(scope);
+  refreshAttBadge(a.taskId);
+}
+
+/* ---- 大图预览 ---- */
+
+function renderLightbox() {
+  const el = document.getElementById('lightbox');
+  if (!el) return;
+  const lb = state.lightbox;
+  if (!lb) { el.classList.remove('open'); el.innerHTML = ''; return; }
+  el.innerHTML = `
+    <div class="lightbox-bar">
+      <span class="lightbox-name">${esc(lb.name || '')}</span>
+      <button class="icon-btn" data-act="close-lightbox" title="关闭">
+        <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
+      </button>
+    </div>
+    <img class="lightbox-img" src="${lb.url}" alt="">`;
+  el.classList.add('open');
 }
 
 /* ---------------- 渲染：抽屉 ---------------- */
@@ -1661,6 +2198,7 @@ function renderDrawer() {
         <textarea class="field-textarea" id="d-note" placeholder="补充说明…">${esc(t.note || '')}</textarea>
         <div class="hint">备注会显示在列表里，最多两行</div>
       </div>
+      <div class="field" id="att-field-drawer">${attFieldInner('drawer')}</div>
       ${t.pattern === 'stage' ? subtaskEditor(t) : ''}
       <div class="field">
         <div class="field-label">复用</div>
@@ -1685,6 +2223,7 @@ function renderDrawer() {
     </div>`;
   el.classList.add('open');
   state.drawerRendered = t.id;
+  hydrateThumbs('drawer');
 }
 
 /* ---------------- 新建 / 编辑 弹窗 ---------------- */
@@ -1780,6 +2319,38 @@ function renderModal() {
 
   // 下面三个是辅助小面板（存模板 / 从模板建 / 按日查看），
   // 它们各自只有一个输入框，光标还原交给 restoreModalFocus 就够了
+  // 主界面「从模板新建」的挑模板那一屏。挑完立刻接基准日，所以这屏只有一个动作。
+  if (state.tplPick) {
+    const list = state.templates || [];
+    modal.innerHTML = `
+      <div class="modal-head">
+        <h2>从模板新建</h2>
+        <button class="icon-btn" data-act="close-aux-modal">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        ${list.length ? `
+          <div class="hint">挑一个模板，再选个起算的日子，整套工作和子任务连同日期一次建出来。</div>
+          <div class="tpl-pick-list">
+            ${list.map(t => `
+              <button class="tpl-pick" data-act="tpl-apply" data-id="${t.id}">
+                <span class="tpl-pick-main">
+                  <span class="tpl-pick-name">${esc(t.name)}</span>
+                  <span class="tpl-pick-meta">${esc(tplMeta(t))}</span>
+                </span>
+                <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5 10.5 8 6 12.5"/></svg>
+              </button>`).join('')}
+          </div>` : `
+          <div class="empty">
+            还没有模板。<br>
+            打开任意一条工作的详情，点「存为模板」，就能把整套结构连同步骤存下来。
+          </div>`}
+      </div>`;
+    mask.classList.add('open');
+    return;
+  }
+
   if (state.tplSaving) {
     const s = state.tplSaving;
     modal.innerHTML = `
@@ -1909,6 +2480,14 @@ function renderModal() {
 
   const today = todayLocal();
 
+  // 在分类页里新建时，分类已经定了，界面上只占一行、不再让人挑一遍。
+  // 点了「更改」（catPickerOpen）或者本来就在「今天 / 全部」这种没有分类上下文的视图里，
+  // 才铺开整排分类让人选。
+  const ctxCat = (!e.id && !state.catPickerOpen) ? viewCategoryId() : undefined;
+  const ctxCatObj = ctxCat === null || ctxCat === undefined ? null : catById(ctxCat);
+  const ctxCatName = ctxCat === null ? '未分类' : (ctxCatObj?.name || '未分类');
+  const ctxCatColor = ctxCat === null ? '#CBD5E1' : (ctxCatObj?.color || '#CBD5E1');
+
   modal.innerHTML = `
     <div class="modal-head">
       <h2>${e.id ? '编辑工作' : '新建工作'}</h2>
@@ -1940,6 +2519,14 @@ function renderModal() {
 
     <div class="field">
       <div class="field-label">分类</div>
+      ${ctxCat !== undefined ? `
+      <div class="row-between">
+        <span class="cat-fixed">
+          <span class="swatch" style="background:${ctxCatColor}"></span>${esc(ctxCatName)}
+        </span>
+        <button class="btn btn-ghost" data-act="m-cat-open">更改</button>
+      </div>
+      <div class="hint">在当前分类里新建，已经替你选好了</div>` : `
       <div class="cat-grid">
         ${state.categories.map(c => `
           <button class="cat-pill ${e.categoryId === c.id ? 'on' : ''}"
@@ -1950,7 +2537,7 @@ function renderModal() {
         <button class="cat-pill ${e.categoryId == null ? 'on' : ''}" data-act="m-cat" data-cat="">
           <span class="swatch" style="background:#CBD5E1"></span>未分类
         </button>
-      </div>
+      </div>`}
     </div>
 
     ${e.pattern === 'recurring' ? `
@@ -2014,6 +2601,8 @@ function renderModal() {
       <div class="field-label">备注（可选）</div>
       <textarea class="field-textarea" id="m-note" placeholder="补充说明、链接、要点…">${esc(e.note || '')}</textarea>
     </div>
+
+    <div class="field" id="att-field-modal">${attFieldInner('modal')}</div>
     </div>
 
     <div class="modal-foot">
@@ -2022,6 +2611,7 @@ function renderModal() {
     </div>`;
   mask.classList.add('open');
   setTimeout(() => restoreModalFocus(keep, 'm-title'), 30);
+  hydrateThumbs('modal');
 }
 
 /* ---------------- 交互 ---------------- */
@@ -2187,14 +2777,23 @@ function openEditor(id, preset) {
     const t = state.tasks.find(x => x.id === id);
     state.editing = JSON.parse(JSON.stringify(t));
   } else {
+    // 站在某个分类页里新建，就把这个分类直接带上 —— 用户已经在那页了，
+    // 再让他从一排分类里挑一遍是多余的一步。
+    // 只有「今天 / 全部」这类没有分类上下文的视图才退回默认第一个分类。
+    const ctx = viewCategoryId();
     state.editing = {
-      id: 0, title: '', note: '', categoryId: state.categories[0]?.id || 1,
+      id: 0, title: '', note: '',
+      categoryId: ctx === undefined ? (state.categories[0]?.id ?? 1) : ctx,
       pattern: 'once', status: 'todo', dueAt: null, rule: { freq: 'weekly', byDay: [5], time: '17:00' },
+      // 新建时还没有数据库 id，粘贴进来的附件先在这儿攒着，保存成功后再入库
+      atts: [],
     };
     // 从日历格子点进来的：那一天就是要填的日期。
     // 开始日和交期都先落在那天，用户切成「阶段性」也不用再选一遍
     if (preset) Object.assign(state.editing, preset);
   }
+  // 分类是自动带上的时候，界面上只显示一行；用户点了「更改」才铺开整排
+  state.catPickerOpen = false;
   state.catEditing = null;
   state.tplApplying = null;
   state.tplSaving = null;
@@ -2239,7 +2838,14 @@ async function saveModal() {
 
   if (hasTauri) {
     try {
-      e.id ? await inv('update_task', { task: e }) : await inv('create_task', { task: e });
+      if (e.id) {
+        await inv('update_task', { task: e });
+      } else {
+        const created = await inv('create_task', { task: e });
+        // 新建时暂存的附件，要拿到 id 之后才入得了库。
+        // 放在 loadAll 之前：loadAll 会用库里的最新数据覆盖 state.attachments
+        await flushPendingAttachments(created.id);
+      }
       await loadAll();
     } catch (err) { console.warn(err); }
   } else {
@@ -2265,6 +2871,9 @@ async function deleteTask(id) {
   // 必须连子孙一起清：只滤掉直接子任务的话，第三层会变成没人认领的孤儿
   const doomed = new Set([id, ...subtreeIds(id)]);
   state.subtasks = state.subtasks.filter(s => !doomed.has(s.id));
+  // 附件挂在工作上，库里靠外键级联删；内存里也得跟着清，
+  // 否则缩略图会一直留在缓存里，别的条目还可能把计数算错
+  state.attachments = state.attachments.filter(a => !doomed.has(a.taskId));
   if (doomed.has(state.subAddFor)) state.subAddFor = null;
   if (hasTauri) { try { await inv('delete_task', { id }); } catch (e) { console.warn(e); } }
   state.drawerId = null;
@@ -2320,6 +2929,20 @@ function openDayView(dateStr) {
 }
 
 /** 「存为模板」：起个名字，把这条工作连同各层步骤一起存进模板库 */
+/** 主界面的「从模板新建」：就地列模板让人挑，不用先跳到模板页。
+ *  「这套流程今天要走一遍」的场景下，多一步切视图就是多一次打断。 */
+function openTplPicker() {
+  state.tplPick = true;
+  state.editing = null;
+  state.catEditing = null;
+  state.tplApplying = null;
+  state.tplSaving = null;
+  state.dayView = null;
+  state.reward = false;
+  modalFocus = null;
+  renderModal();
+}
+
 function openSaveTemplate() {
   const t = state.tasks.find(x => x.id === state.drawerId);
   if (!t) return;
@@ -2356,6 +2979,7 @@ function openApplyTemplate(id) {
   state.editing = null;
   state.catEditing = null;
   state.tplSaving = null;
+  state.tplPick = false;   // 从模板列表点进来的，那层列表要收掉，否则会盖住基准日这一步
   modalFocus = null;
   renderModal();
 }
@@ -2646,6 +3270,20 @@ function bind() {
       if (a === 'save-as-template') { openSaveTemplate(); return; }
       if (a === 'close-modal') { state.editing = null; modalFocus = null; renderModal(); return; }
 
+      // 附件：抽屉和弹窗共用一套动作，靠 data-scope 区分作用域
+      if (a === 'att-pick') { pickFiles(act.dataset.scope); return; }
+      if (a === 'att-del') {
+        const x = findAtt(act.dataset.scope, act.dataset.key);
+        if (x) deleteAttachment(x, act.dataset.scope);
+        return;
+      }
+      if (a === 'att-open') {
+        const x = findAtt(act.dataset.scope, act.dataset.key);
+        if (x) openAttachment(x);
+        return;
+      }
+      if (a === 'close-lightbox') { state.lightbox = null; renderLightbox(); return; }
+
       // 下面几个控件都会让弹窗整块重绘，所以动手前必须先把已输入的内容收回来，
       // 否则新画出来的表单拿的还是旧 state，用户刚敲的标题就没了
       if (a === 'm-pattern') {
@@ -2664,6 +3302,8 @@ function bind() {
         if (state.editing) state.editing.categoryId = v === '' ? null : Number(v);
         renderModal(); return;
       }
+      // 自动带上的分类想改：把整排分类铺开
+      if (a === 'm-cat-open') { syncEditorFields(); state.catPickerOpen = true; renderModal(); return; }
       if (a === 'm-freq') {
         syncEditorFields();
         const e = state.editing;
@@ -2726,10 +3366,10 @@ function bind() {
         return;
       }
 
-      // 辅助面板：存模板 / 从模板新建 / 按日查看 / 赞赏码
+      // 辅助面板：挑模板 / 存模板 / 从模板新建 / 按日查看 / 赞赏码
       if (a === 'open-reward') { state.reward = true; renderModal(); return; }
       if (a === 'close-aux-modal') {
-        state.tplApplying = null; state.tplSaving = null; state.dayView = null;
+        state.tplPick = false; state.tplApplying = null; state.tplSaving = null; state.dayView = null;
         state.reward = false;
         renderModal(); return;
       }
@@ -2749,8 +3389,21 @@ function bind() {
         const k = act.dataset.key;
         state.settings = state.settings || {};
         state.settings[k] = settingOn(k) ? '0' : '1';
+        // 贴边隐藏和边缘分屏抢同一条屏幕边：打开一个，另一个必须让位。
+        // 后端也会改这一行，这里先改是为了界面上立刻看得到结果，
+        // 不用等 invoke 回来再刷新 —— 开关自己跳回去会让人以为是 bug。
+        if (state.settings[k] === '1' && (k === 'snap' || k === 'edge')) {
+          const other = k === 'snap' ? 'edge' : 'snap';
+          state.settings[other] = '0';
+          if (hasTauri) inv('set_setting', { key: other, value: '0' }).catch(console.warn);
+        }
         renderView();
         if (hasTauri) inv('set_setting', { key: k, value: state.settings[k] }).catch(console.warn);
+        // 关掉贴边隐藏时窗口可能正滑在屏幕外，得先把它请回来 ——
+        // 不然开关是关了，窗口却还挂在边上只露一条窄边，看着像坏了
+        if (k === 'edge' && state.settings[k] === '0' && hasTauri) {
+          inv('edge_reset').catch(console.warn);
+        }
         return;
       }
       if (a === 'open-data-dir') {
@@ -2758,6 +3411,7 @@ function bind() {
         inv('open_data_dir').catch(err => { console.warn(err); toast('打开目录失败'); });
         return;
       }
+      if (a === 'toggle-portable') { togglePortable(); return; }
       if (a === 'backup-now')  { backupNow();  return; }
       if (a === 'restore-now') { restoreNow(); return; }
       if (a === 'export-csv')  { exportCsv();  return; }
@@ -2787,10 +3441,17 @@ function bind() {
     if (nav) { state.view = nav.dataset.nav; renderAll_(); return; }
 
     if (ev.target.id === 'modal-mask') {
-      state.editing = null; state.catEditing = null; state.reward = false;
+      state.editing = null; state.catEditing = null;
+      // 辅助面板（挑模板 / 存模板 / 按日 / 赞赏）也一并关掉 ——
+      // 它们和主弹窗是同一个遮罩，点外面只有一部分能关会显得时灵时不灵
+      state.tplPick = false; state.tplApplying = null; state.tplSaving = null;
+      state.dayView = null; state.reward = false;
       renderModal();
       return;
     }
+
+    // 大图预览：点图片以外的空白处关掉（点图片本身不关，那是要看的地方）
+    if (ev.target.id === 'lightbox') { state.lightbox = null; renderLightbox(); return; }
 
     // 抽屉是并排布局、没有遮罩，「点旁边空白」是用户最自然的关闭动作。
     // 只有角上的 X 和 Esc 能关的话，会被当成「关不掉」——这正是有人反馈的那条。
@@ -2803,6 +3464,14 @@ function bind() {
   });
 
   document.getElementById('btn-new').addEventListener('click', () => openEditor(null));
+  // 主界面入口：反复要走的那套流程就地重建，不必先切到模板页
+  document.getElementById('btn-from-tpl').addEventListener('click', () => openTplPicker());
+
+  /* 贴边隐藏的鼠标进出判定不在这里 —— 收起后整扇窗只剩几像素露在屏幕里，
+     那几像素仍然是窗口的一部分，鼠标停上去会一直触发「进入」事件，窗口刚收起
+     就被自己叫回来；而且那一瞬间鼠标本来就压在边上，前端分不出「碰一下」和
+     「刚拖完还按着」。改由后端轮询采样（窗口矩形 + 鼠标绝对坐标 + 左键状态）
+     统一判定，前端只负责下面那个状态监听把「把手」画出来。 */
 
   // 记住弹窗里最近聚焦的那个输入框。控件一点就整块重绘，重绘后要照着这条记录
   // 把光标还回去（点击按钮本身会让按钮成为 activeElement，靠它找不回输入框）
@@ -2818,6 +3487,45 @@ function bind() {
     if (el) renameSubtask(Number(el.dataset.subTitle), el.value);
   });
 
+  /* 附件采集：粘贴 / 拖拽 / 选文件。
+     粘贴挂在 document 上，因为用户常常是刚点开抽屉就按 Ctrl+V，焦点还在别处；
+     挂在某个输入框上会漏掉这种情况。 */
+  document.addEventListener('paste', ev => {
+    const scope = currentAttScope();
+    if (!scope) return;
+    const items = ev.clipboardData && ev.clipboardData.items;
+    if (!items) return;
+    // 按下标取而不是 for...of：DataTransferItemList 不是规范要求的可迭代对象，
+    // 靠 Symbol.iterator 遍历在部分内核上会直接抛。下标访问是规范保证的
+    const files = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it && it.kind === 'file') { const f = it.getAsFile(); if (f) files.push(f); }
+    }
+    // 剪贴板里是纯文字就放行 —— 用户多半在往备注里粘内容，不该被抢走
+    if (!files.length) return;
+    ev.preventDefault();
+    handleFiles(files, scope);
+  });
+
+  // 拖拽：只认落在附件投放区里的，别的地方该怎么拖还怎么拖
+  document.addEventListener('dragover', ev => {
+    const z = ev.target.closest?.('[data-att-zone]');
+    if (!z) return;
+    ev.preventDefault();
+    z.classList.add('drag');
+  });
+  document.addEventListener('dragleave', ev => {
+    ev.target.closest?.('[data-att-zone]')?.classList.remove('drag');
+  });
+  document.addEventListener('drop', ev => {
+    const z = ev.target.closest?.('[data-att-zone]');
+    if (!z) return;
+    ev.preventDefault();
+    z.classList.remove('drag');
+    handleFiles(Array.from((ev.dataTransfer && ev.dataTransfer.files) || []), z.dataset.attZone);
+  });
+
   document.addEventListener('keydown', ev => {
     const el = ev.target;
     const typing = el instanceof HTMLElement && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
@@ -2826,11 +3534,14 @@ function bind() {
     if (el?.classList?.contains('sub-title') && ev.key === 'Enter') { ev.preventDefault(); el.blur(); return; }
 
     if (ev.key === 'Escape') {
+      // 大图铺在最上层，Esc 先关它 —— 一次只退一层
+      if (state.lightbox) { state.lightbox = null; renderLightbox(); return; }
       // 正在输入时按 Esc 只退出输入，不顺手把整个面板关掉
       if (typing) { el.blur(); return; }
       if (state.ctxMenu) { closeCtxMenu(); }
-      else if (state.dayView || state.tplApplying || state.tplSaving || state.reward) {
+      else if (state.dayView || state.tplApplying || state.tplSaving || state.tplPick || state.reward) {
         state.dayView = null; state.tplApplying = null; state.tplSaving = null;
+        state.tplPick = false;
         state.reward = false;
         renderModal();
       }
@@ -2959,6 +3670,18 @@ function bindBackendEvents() {
       })
       .catch(console.warn);
   });
+
+  // 贴边隐藏：收起 / 展开全由后端轮询线程决定，这里只跟着改样式。
+  // 露在外面的那几像素本来就是窗口的边缘，得给个颜色才看得出是「把手」，
+  // 不然用户看到的是一条说不清是什么的窄边。
+  listen('edge://changed', ev => {
+    const p = ev.payload || {};
+    state.edgeCollapsed = !!p.collapsed;
+    // 展开之后 side 仍然保留：鼠标再移开还要按同一边收回去
+    state.edgeSide = p.side || '';
+    document.body.classList.toggle('edge-collapsed', state.edgeCollapsed);
+    document.body.dataset.edgeSide = state.edgeSide;
+  });
 }
 
 /* ---------------- 启动 ---------------- */
@@ -2967,4 +3690,7 @@ function bindBackendEvents() {
   bind();
   bindBackendEvents();
   renderAll_();
+  // 刚搬过数据就说一声。后端只给一次（读走即清），所以这里不用去重
+  const note = state.dataInfo && state.dataInfo.note;
+  if (note) toast(note);
 })();

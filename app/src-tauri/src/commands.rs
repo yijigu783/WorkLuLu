@@ -1,4 +1,5 @@
 use crate::AppState;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Timelike};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -915,6 +916,10 @@ pub fn get_settings(state: State<'_, AppState>) -> R<HashMap<String, String>> {
     Ok(map)
 }
 
+/// 设置项落库。一律用 upsert，不存在就建。
+const SETTING_UPSERT: &str = "INSERT INTO settings (key, value) VALUES (?1, ?2)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
 #[tauri::command]
 pub fn set_setting(
     app: tauri::AppHandle,
@@ -922,20 +927,34 @@ pub fn set_setting(
     key: String,
     value: String,
 ) -> R<()> {
+    // 「贴边隐藏」和「边缘分屏」盯的是同一条屏幕边：窗口拖到左边到底是摆半屏
+    // 还是藏起来，同一时刻只能有一个说了算，所以打开一个必须关掉另一个。
+    //
+    // 这条互斥由后端执行，界面上的互斥只是提前把结果显示出来。
+    // 判据不能只活在前端 —— 以后多一个改设置的入口，就得多记一次「别忘了互斥」，
+    // 放在这里是一劳永逸。
+    let on = matches!(value.as_str(), "1" | "true" | "on");
+    let counterpart = match key.as_str() {
+        "snap" if on => Some("edge"),
+        "edge" if on => Some("snap"),
+        _ => None,
+    };
     {
-        let conn = state.db.lock().map_err(e2s)?;
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )
-        .map_err(e2s)?;
+        // 一个事务里写两行：中途失败不会留下「一个开了、另一个也开着」的状态
+        let mut conn = state.db.lock().map_err(e2s)?;
+        let tx = conn.transaction().map_err(e2s)?;
+        tx.execute(SETTING_UPSERT, params![key, value])
+            .map_err(e2s)?;
+        if let Some(other) = counterpart {
+            tx.execute(SETTING_UPSERT, params![other, "0"])
+                .map_err(e2s)?;
+        }
+        tx.commit().map_err(e2s)?;
     }
 
     // 开机自启是要真切生效的系统行为，不能只写个开关就当设过了
     if key == "autostart" {
         use tauri_plugin_autostart::ManagerExt;
-        let on = matches!(value.as_str(), "1" | "true" | "on");
         let mgr = app.autolaunch();
         let done = if on { mgr.enable() } else { mgr.disable() };
         done.map_err(|e| format!("写入开机自启失败：{e}"))?;
@@ -943,9 +962,136 @@ pub fn set_setting(
     Ok(())
 }
 
+/* ---------------- 数据存放位置（标准 / 便携） ----------------
+   需求来自使用反馈：数据位置能不能自己定，想做成便携版 —— 整个文件夹拷到 U 盘就能带走。
+   判定与搬家的实现在 db.rs，这里只做「编排」和给界面看的信息。 */
+
+/// 「数据存放位置」那张卡片要的全部信息：画徽标、拼确认框文案、显示启动时的搬迁提示。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataInfo {
+    /// 实际在用的目录
+    pub path: String,
+    /// 当前是不是便携模式
+    pub portable: bool,
+    /// 切成便携模式后会用的目录
+    pub portable_path: String,
+    /// 切回标准模式后会用的目录
+    pub standard_path: String,
+    /// 便携模式不可用的原因（exe 在只读位置之类）。空串表示没查出问题
+    pub blocked: String,
+    /// 启动时若刚搬过家，给用户一句话。只给一次，之后是 null
+    pub note: Option<String>,
+}
+
 #[tauri::command]
-pub fn data_dir(app: tauri::AppHandle) -> R<String> {
-    Ok(crate::db::data_dir(&app).to_string_lossy().to_string())
+pub fn data_info(app: tauri::AppHandle, state: State<'_, AppState>) -> R<DataInfo> {
+    let exe = crate::db::exe_dir().ok_or("拿不到程序所在目录")?;
+    let portable_path = crate::db::portable_data_dir(&exe);
+    let standard_path = crate::db::standard_data_dir(&app);
+    let current = crate::db::data_dir(&app);
+    let portable = current == portable_path;
+
+    // 预检查只探 exe 目录能不能写，**绝不碰 portable_path** ——
+    // 一旦把 data 目录建出来，它自己就成了便携模式的触发器
+    let blocked = if portable {
+        String::new()
+    } else {
+        crate::db::probe_writable(&exe).err().unwrap_or_default()
+    };
+
+    let note = state.portable_note.lock().ok().and_then(|mut g| g.take());
+    Ok(DataInfo {
+        path: current.to_string_lossy().to_string(),
+        portable,
+        portable_path: portable_path.to_string_lossy().to_string(),
+        standard_path: standard_path.to_string_lossy().to_string(),
+        blocked,
+        note,
+    })
+}
+
+/// 把连接暂时换成内存库，旧的随之 drop —— 文件句柄这才释放，搬移才做得成。
+///
+/// 顺带一个好处：SQLite 在最后一个连接关闭时会把 `-wal` 并回主文件并删掉它，
+/// 所以真正要搬的文件常常只剩数据库本体一个。
+fn close_db(state: &State<'_, AppState>) -> R<()> {
+    let mut guard = state.db.lock().map_err(e2s)?;
+    let placeholder = Connection::open_in_memory().map_err(e2s)?;
+    drop(std::mem::replace(&mut *guard, placeholder));
+    Ok(())
+}
+
+/// 把连接重新指到指定目录的库上
+fn reopen_db(state: &State<'_, AppState>, dir: &std::path::Path) -> R<()> {
+    let conn = Connection::open(dir.join(crate::db::DB_FILE)).map_err(e2s)?;
+    let mut guard = state.db.lock().map_err(e2s)?;
+    *guard = conn;
+    Ok(())
+}
+
+/// 切换数据的存放位置。
+///
+/// 顺序很讲究：先探可写 → 再留快照 → 关连接释放文件锁 → 搬 → 补标记 → 重开连接。
+/// 中途失败要么当场中止（还没动手），要么把连接支回原处让程序接着能用。
+#[tauri::command]
+pub fn set_portable(app: tauri::AppHandle, state: State<'_, AppState>, on: bool) -> R<String> {
+    let exe = crate::db::exe_dir().ok_or("拿不到程序所在目录，没法切便携模式")?;
+    let portable_dir = crate::db::portable_data_dir(&exe);
+    let current = crate::db::data_dir(&app);
+    let target = if on {
+        portable_dir.clone()
+    } else {
+        crate::db::standard_data_dir(&app)
+    };
+    if target == current {
+        return Ok("已经是这个模式了，没有改动".into());
+    }
+
+    // 1) 目标写得进去吗。便携模式最常踩的坑是 exe 放在只读位置（Program Files / 只读 U 盘）
+    crate::db::ensure_writable(&target)?;
+
+    // 2) 动手之前先给「现在」留一份。它落在当前目录的 backups 里，会跟着一起搬走
+    {
+        let conn = state.db.lock().map_err(e2s)?;
+        let dir = current.join("backups");
+        std::fs::create_dir_all(&dir).map_err(e2s)?;
+        let snapshot = dir.join(format!(
+            "换存储位置前-{}.db",
+            now_local().format("%Y%m%d-%H%M%S")
+        ));
+        write_backup(&conn, &snapshot)
+            .map_err(|e| format!("切换前没能保存当前数据快照，为安全起见已中止：{e}"))?;
+    }
+
+    // 3) 关连接，把文件句柄让出来
+    close_db(&state)?;
+
+    // 4) 搬。搬不动就把连接支回原处，程序接着能用
+    if let Err(e) = crate::db::move_data(&current, &target) {
+        let _ = reopen_db(&state, &current);
+        return Err(e);
+    }
+
+    // 5) 补上 / 撤掉标记。便携模式下 data 目录本身就是触发器，portable.txt 是再补一个显式的
+    if on {
+        std::fs::write(exe.join(crate::db::PORTABLE_MARKER), b"")
+            .map_err(|e| format!("数据已经搬过去了，但标记文件没写成：{e}"))?;
+    } else {
+        let _ = std::fs::remove_file(exe.join(crate::db::PORTABLE_MARKER));
+        // 空的才删得掉；里面若还有别的东西就留着，不硬删用户的东西
+        let _ = std::fs::remove_dir(&portable_dir);
+    }
+
+    // 6) 连接指到新位置
+    reopen_db(&state, &target)?;
+
+    let what = if on {
+        "已切到便携模式，数据搬到程序旁的 data 文件夹"
+    } else {
+        "已切回标准模式，数据搬回用户目录"
+    };
+    Ok(format!("{what}：{}", target.to_string_lossy()))
 }
 
 /// 界面「关于」里显示的版本号。
@@ -965,16 +1111,284 @@ pub fn open_data_dir(app: tauri::AppHandle) -> R<()> {
     tauri_plugin_opener::open_path(&dir, None::<String>).map_err(e2s)
 }
 
+/* ---------------- 贴边自动隐藏 ----------------
+ *
+ *  判定与窗口操作全在 `edge.rs` 里，由后台轮询线程驱动 —— 展开 / 收回要看鼠标的
+ *  绝对位置和左键状态，前端拿不到这些，也判断不出显示器边界和最大化状态。
+ *  这里只留一个 `edge_reset`，给「关掉开关」用。
+ */
+
+/// 关掉贴边开关时调用：窗口可能正滑在屏幕外，先请回屏幕里。
+#[tauri::command]
+pub fn edge_reset(window: tauri::Window) -> R<()> {
+    crate::edge::reset(&window);
+    Ok(())
+}
+
+/* ---------------- 附件（粘贴的图片 / 上传的文件） ----------------
+ *
+ *  场景来自使用反馈：把跟别人的聊天截图直接粘进来留痕。
+ *
+ *  图片本体存进数据库，不落成数据目录里的散文件 —— 这样 `VACUUM INTO` 导出备份时
+ *  会连图片一起带走，「一个 .db 拷到 U 盘就是全部数据」这条语义不用改。
+ *  代价是库会变大，所以粘贴时前端会先压一道（见 app.js 的 prepareImage）。
+ */
+
+/// 单个附件的体积上限。留痕用的截图和文档远到不了这个量级，
+/// 但一个手滑拖进来的视频能把库撑到没法备份，所以还是要拦。
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// 列表用的列：**不含** data 本体。列表只要元信息，把几十 MB 的图片
+/// 跟着列表一起搬过来，抽屉一打开就会卡住。
+const ATT_COLS: &str =
+    "id, task_id, name, mime, size, kind, created_at, (thumb IS NOT NULL) AS has_thumb";
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub id: i64,
+    pub task_id: i64,
+    pub name: String,
+    pub mime: String,
+    pub size: i64,
+    /// image（界面里直接看）/ file（交给系统默认程序打开）
+    pub kind: String,
+    /// 有没有缩略图。图片才有，列表靠它决定要不要去取小图
+    pub has_thumb: bool,
+    pub created_at: Option<String>,
+}
+
+fn row_to_attachment(row: &Row) -> rusqlite::Result<Attachment> {
+    Ok(Attachment {
+        id: row.get("id")?,
+        task_id: row.get("task_id")?,
+        name: row.get("name")?,
+        mime: row.get("mime")?,
+        size: row.get("size")?,
+        kind: row.get("kind")?,
+        has_thumb: row.get("has_thumb")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn fetch_attachment(conn: &Connection, id: i64) -> R<Attachment> {
+    conn.query_row(
+        &format!("SELECT {ATT_COLS} FROM attachments WHERE id = ?1"),
+        params![id],
+        row_to_attachment,
+    )
+    .map_err(e2s)
+}
+
+/// 拼成浏览器能直接用的 data URL。
+/// mime 为空（少数文件读不出类型）时给个通用的，免得 `data:;base64,` 这种拼出来没人认。
+fn data_url(mime: &str, bytes: &[u8]) -> String {
+    let m = if mime.trim().is_empty() { "application/octet-stream" } else { mime };
+    format!("data:{m};base64,{}", STANDARD.encode(bytes))
+}
+
+/// 附件元信息。`task_id` 传了就只取那一条工作的，不传取全部。
+///
+/// 不传时前端一次拿全，好处是列表/看板上的「有附件」标记不用再逐条问一次；
+/// 元信息很小（名字、大小、类型），几十上百条也不值得分次取。
+///
+/// 抽成自由函数而不是直接写在命令里，是为了能脱离 Tauri 的 State 写测试。
+pub(crate) fn list_attachments_of(conn: &Connection, task_id: Option<i64>) -> R<Vec<Attachment>> {
+    let (sql, ids): (String, Vec<i64>) = match task_id {
+        Some(id) => (
+            format!("SELECT {ATT_COLS} FROM attachments WHERE task_id = ?1 ORDER BY id"),
+            vec![id],
+        ),
+        None => (format!("SELECT {ATT_COLS} FROM attachments ORDER BY task_id, id"), vec![]),
+    };
+    let mut stmt = conn.prepare(&sql).map_err(e2s)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), row_to_attachment)
+        .map_err(e2s)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(e2s)
+}
+
+#[tauri::command]
+pub fn list_attachments(state: State<'_, AppState>, task_id: Option<i64>) -> R<Vec<Attachment>> {
+    let conn = state.db.lock().map_err(e2s)?;
+    list_attachments_of(&conn, task_id)
+}
+
+/// 存一个附件。`data_b64` / `thumb_b64` 都是**不带前缀**的 base64
+/// （前端已经剥掉 `data:...;base64,`）。
+///
+/// 前端先把图片压过一道再送过来，所以这里只做体积与合法性检查，不做二次压缩 ——
+/// 后端再编一遍图会让粘贴有明显停顿。
+pub(crate) fn insert_attachment(
+    conn: &Connection,
+    task_id: i64,
+    name: &str,
+    mime: &str,
+    kind: &str,
+    data_b64: &str,
+    thumb_b64: Option<&str>,
+) -> R<Attachment> {
+    let bytes = STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|_| "附件数据读不出来，请重试".to_string())?;
+    if bytes.is_empty() {
+        return Err("这是个空文件，没有内容可存".into());
+    }
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "单个附件不能超过 {} MB",
+            MAX_ATTACHMENT_BYTES / 1024 / 1024
+        ));
+    }
+    // 缩略图坏掉不该让整条失败：没有它顶多是列表多取一次原图
+    let thumb_bytes = thumb_b64
+        .filter(|t| !t.is_empty())
+        .and_then(|t| STANDARD.decode(t.as_bytes()).ok());
+
+    let kind = if kind == "image" { "image" } else { "file" }.to_string();
+
+    // 外键其实会拦住，但那样报出来的是一句 SQL 错误，用户看不懂
+    let exists: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks WHERE id = ?1", params![task_id], |r| r.get(0))
+        .map_err(e2s)?;
+    if exists == 0 {
+        return Err("这条工作已经不在了".into());
+    }
+
+    let name = if name.trim().is_empty() { "未命名附件".to_string() } else { name.to_string() };
+    conn.execute(
+        "INSERT INTO attachments (task_id, name, mime, size, kind, data, thumb, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            task_id,
+            name,
+            mime,
+            bytes.len() as i64,
+            kind,
+            bytes,
+            thumb_bytes,
+            now_local().to_rfc3339()
+        ],
+    )
+    .map_err(e2s)?;
+    fetch_attachment(conn, conn.last_insert_rowid())
+}
+
+#[tauri::command]
+pub fn add_attachment(
+    state: State<'_, AppState>,
+    task_id: i64,
+    name: String,
+    mime: String,
+    kind: String,
+    data: String,
+    thumb: Option<String>,
+) -> R<Attachment> {
+    let conn = state.db.lock().map_err(e2s)?;
+    insert_attachment(&conn, task_id, &name, &mime, &kind, &data, thumb.as_deref())
+}
+
+/// 取附件内容，返回 data URL。
+///
+/// `thumb = true` 时优先给缩略图：列表里一格一格的小图不该把原图整块拉过来，
+/// 几十张截图一起加载会让抽屉卡住。没有缩略图（或不是图片）就退回原图。
+pub(crate) fn attachment_data_url(conn: &Connection, id: i64, thumb: bool) -> R<String> {
+    if thumb {
+        let t: Option<Vec<u8>> = conn
+            .query_row("SELECT thumb FROM attachments WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .map_err(e2s)?
+            .flatten();
+        if let Some(bytes) = t {
+            // 缩略图统一编成 JPEG（前端生成时就是），省得再往库里存一份 mime
+            return Ok(data_url("image/jpeg", &bytes));
+        }
+    }
+
+    let (mime, data): (String, Vec<u8>) = conn
+        .query_row(
+            "SELECT mime, data FROM attachments WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| "这个附件已经不在了".to_string())?;
+    Ok(data_url(&mime, &data))
+}
+
+#[tauri::command]
+pub fn get_attachment(state: State<'_, AppState>, id: i64, thumb: Option<bool>) -> R<String> {
+    let conn = state.db.lock().map_err(e2s)?;
+    attachment_data_url(&conn, id, thumb.unwrap_or(false))
+}
+
+pub(crate) fn remove_attachment(conn: &Connection, id: i64) -> R<()> {
+    conn.execute("DELETE FROM attachments WHERE id = ?1", params![id])
+        .map_err(e2s)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_attachment(state: State<'_, AppState>, id: i64) -> R<()> {
+    let conn = state.db.lock().map_err(e2s)?;
+    remove_attachment(&conn, id)
+}
+
+/// 把文件名清洗成一个能落盘的裸名字。
+/// 名字是从剪贴板/文件系统来的，可能带路径分隔符或 Windows 非法字符，
+/// 直接拿去 join 会被写到别处去（`..\..\` 这类）。
+fn safe_file_name(name: &str, id: i64) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || (c as u32) < 32 {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() {
+        format!("附件-{id}")
+    } else {
+        cleaned
+    }
+}
+
+/// 用系统默认程序打开附件。
+///
+/// 图片在界面里就能看，这个入口主要是给 PDF / Word 这类文件用的。
+/// 落到临时目录而不是数据目录：用户改完不需要回写，也不该在数据目录里留一堆散文件。
+#[tauri::command]
+pub fn open_attachment(state: State<'_, AppState>, id: i64) -> R<()> {
+    let (name, data): (String, Vec<u8>) = {
+        let conn = state.db.lock().map_err(e2s)?;
+        conn.query_row(
+            "SELECT name, data FROM attachments WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| "这个附件已经不在了".to_string())?
+    };
+
+    let dir = std::env::temp_dir().join("工作记录本-附件");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("没法建临时目录：{e}"))?;
+    let path = dir.join(safe_file_name(&name, id));
+    std::fs::write(&path, &data).map_err(|e| format!("写临时文件失败：{e}"))?;
+    tauri_plugin_opener::open_path(&path, None::<String>).map_err(e2s)
+}
+
 /* ---------------- 备份 / 恢复 / 导出 ---------------- */
 
 /// 一份完整备份要有的四张表。少一张就不认。
 /// 备份里**必须**有的表。少一张就不是本程序导出的备份。
 const TABLES: [&str; 4] = ["categories", "tasks", "completions", "settings"];
 
-/// 后来才加进来的模块（模板库）。
+/// 后来才加进来的模块（模板库、附件）。
 /// 老备份里没有它们——为一张新增的表去拒绝一个旧备份，用户会平白丢掉全部数据。
 /// 所以按「有就一起搬、没有就跳过」处理：可选，但一旦存在就得列数对得上。
-const OPTIONAL_TABLES: [&str; 2] = ["templates", "template_items"];
+const OPTIONAL_TABLES: [&str; 3] = ["templates", "template_items", "attachments"];
 
 /// 恢复前的自动快照放这儿，跟数据文件同目录，方便一起搬走
 fn backup_dir_of(app: &tauri::AppHandle) -> std::path::PathBuf {
@@ -1024,11 +1438,19 @@ fn read_backup(conn: &mut Connection, src: &std::path::Path) -> R<()> {
     conn.execute("ATTACH DATABASE ?1 AS bak", params![src_str])
         .map_err(|e| format!("没法挂载备份文件：{e}"))?;
 
-    // 备份里有没有模板表，决定这次要不要一起搬。
-    // 1.0.x 建的备份里没有这两张表，硬搬会直接报「no such table」
+    // 备份里有没有模板表 / 附件表，决定这次要不要一起搬。
+    // 1.0.x 建的备份里没有模板那两张；附件表更晚，老备份同样没有。
+    // 硬搬会直接报「no such table」
     let has_tpl: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM bak.sqlite_master WHERE type = 'table' AND name = 'templates'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let has_att: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bak.sqlite_master WHERE type = 'table' AND name = 'attachments'",
             [],
             |r| r.get(0),
         )
@@ -1037,8 +1459,10 @@ fn read_backup(conn: &mut Connection, src: &std::path::Path) -> R<()> {
     let copied = (|| -> R<()> {
         let tx = conn.transaction().map_err(e2s)?;
         // 删的顺序顺着外键：先删引用别人的。
+        // 附件挂在 tasks 上（CASCADE），但这里显式先删一遍——
+        // 不依赖级联的时机，读起来也一眼能看出「附件是跟着工作走的」。
         // 模板那两张只在有新数据的备份里才动，否则会把用户现有的模板平白清掉
-        for t in ["completions", "tasks"] {
+        for t in ["attachments", "completions", "tasks"] {
             tx.execute(&format!("DELETE FROM main.{t}"), []).map_err(e2s)?;
         }
         if has_tpl > 0 {
@@ -1060,6 +1484,11 @@ fn read_backup(conn: &mut Connection, src: &std::path::Path) -> R<()> {
         }
         for t in ["tasks", "completions", "settings"] {
             tx.execute(&format!("INSERT INTO main.{t} SELECT * FROM bak.{t}"), [])
+                .map_err(e2s)?;
+        }
+        // 附件必须排在 tasks 之后：它外键指着 tasks
+        if has_att > 0 {
+            tx.execute("INSERT INTO main.attachments SELECT * FROM bak.attachments", [])
                 .map_err(e2s)?;
         }
         tx.commit().map_err(e2s)
@@ -1961,5 +2390,215 @@ mod tests {
         assert!(!human_time("2026-09-25T17:00:00+08:00").contains('T'));
         // 解析不了就原样返回，不能把内容吃掉
         assert_eq!(human_time("乱七八糟"), "乱七八糟");
+    }
+
+    /* ---- 附件（粘贴的图片 / 上传的文件） ---- */
+
+    fn b64(bytes: &[u8]) -> String {
+        STANDARD.encode(bytes)
+    }
+
+    /// 存进去 → 列出来 → 取内容，三处口径必须一致
+    #[test]
+    fn attachment_round_trips_through_the_database() {
+        let conn = db();
+        task(&conn, "和甲方的沟通留痕");
+        let tid: i64 = conn.last_insert_rowid();
+
+        let saved = insert_attachment(
+            &conn,
+            tid,
+            "聊天记录.png",
+            "image/png",
+            "image",
+            &b64(b"PNGDATA"),
+            Some(&b64(b"THUMB")),
+        )
+        .expect("存附件");
+
+        assert_eq!(saved.task_id, tid);
+        assert_eq!(saved.kind, "image");
+        assert_eq!(saved.size, 7);
+        assert!(saved.has_thumb);
+
+        let list = list_attachments_of(&conn, Some(tid)).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "聊天记录.png");
+
+        // 原图与缩略图各取各的
+        assert_eq!(attachment_data_url(&conn, saved.id, false).unwrap(), "data:image/png;base64,UE5HREFUQQ==");
+        assert_eq!(attachment_data_url(&conn, saved.id, true).unwrap(), "data:image/jpeg;base64,VEhVTUI=");
+
+        remove_attachment(&conn, saved.id).unwrap();
+        assert!(list_attachments_of(&conn, Some(tid)).unwrap().is_empty());
+    }
+
+    /// 列表里**不能**带图片本体 —— 带上就意味着抽屉一打开要搬几十 MB
+    #[test]
+    fn attachment_metadata_is_selectable_without_the_body() {
+        let conn = db();
+        task(&conn, "带图的工作");
+        let tid: i64 = conn.last_insert_rowid();
+        // 非图片没有缩略图，has_thumb 要是 false，列表才不会去取不存在的小图
+        insert_attachment(&conn, tid, "合同.pdf", "application/pdf", "file", &b64(b"PDF"), None).unwrap();
+
+        let list = list_attachments_of(&conn, None).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].has_thumb);
+        assert_eq!(list[0].kind, "file");
+        // 没有缩略图时退回原图，而不是返回空
+        assert_eq!(
+            attachment_data_url(&conn, list[0].id, true).unwrap(),
+            "data:application/pdf;base64,UERG"
+        );
+    }
+
+    /// 只取某一条工作的附件，别的不能混进来
+    #[test]
+    fn attachments_are_filtered_by_task() {
+        let conn = db();
+        task(&conn, "甲");
+        let a: i64 = conn.last_insert_rowid();
+        task(&conn, "乙");
+        let b: i64 = conn.last_insert_rowid();
+
+        insert_attachment(&conn, a, "a.png", "image/png", "image", &b64(b"A"), None).unwrap();
+        insert_attachment(&conn, b, "b.png", "image/png", "image", &b64(b"B"), None).unwrap();
+
+        assert_eq!(list_attachments_of(&conn, Some(a)).unwrap().len(), 1);
+        assert_eq!(list_attachments_of(&conn, Some(b)).unwrap()[0].name, "b.png");
+        assert_eq!(list_attachments_of(&conn, None).unwrap().len(), 2);
+    }
+
+    /// 附件是这条工作的证据，工作删了证据跟着走（外键 CASCADE）
+    #[test]
+    fn deleting_the_task_takes_its_attachments_with_it() {
+        let conn = db();
+        task(&conn, "要被删掉的工作");
+        let tid: i64 = conn.last_insert_rowid();
+        insert_attachment(&conn, tid, "截图.png", "image/png", "image", &b64(b"X"), None).unwrap();
+
+        conn.execute("DELETE FROM tasks WHERE id = ?1", params![tid]).unwrap();
+
+        assert_eq!(count(&conn, "attachments"), 0, "工作没了，挂在它上面的附件不该留下来");
+    }
+
+    /// 脏数据不能进库：坏 base64、空文件、超限的都要拦下来
+    #[test]
+    fn attachment_rejects_bad_input() {
+        let conn = db();
+        task(&conn, "目标");
+        let tid: i64 = conn.last_insert_rowid();
+
+        assert!(insert_attachment(&conn, tid, "x", "image/png", "image", "这不是 base64!!", None).is_err());
+        assert!(insert_attachment(&conn, tid, "x", "image/png", "image", "", None).is_err());
+
+        let huge = vec![0u8; MAX_ATTACHMENT_BYTES + 1];
+        let err = insert_attachment(&conn, tid, "巨无霸", "image/png", "image", &b64(&huge), None).unwrap_err();
+        assert!(err.contains("MB"), "超限要给人话，不是 SQL 报错：{err}");
+
+        // 上面全部失败之后库里不该留下任何一条
+        assert_eq!(count(&conn, "attachments"), 0);
+    }
+
+    /// 挂到不存在的工作上要拦住，并给一句人话（外键报的是 SQL 错误，用户看不懂）
+    #[test]
+    fn attachment_needs_an_existing_task() {
+        let conn = db();
+        let err = insert_attachment(&conn, 999, "x", "image/png", "image", &b64(b"X"), None).unwrap_err();
+        assert_eq!(err, "这条工作已经不在了");
+    }
+
+    /// 缩略图坏了不该让整条附件存不进去 —— 顶多列表多取一次原图
+    #[test]
+    fn a_broken_thumbnail_does_not_lose_the_attachment() {
+        let conn = db();
+        task(&conn, "目标");
+        let tid: i64 = conn.last_insert_rowid();
+
+        let saved =
+            insert_attachment(&conn, tid, "x.png", "image/png", "image", &b64(b"FULL"), Some("坏缩略图"))
+                .expect("仍应存进去");
+        assert!(!saved.has_thumb);
+        assert_eq!(
+            attachment_data_url(&conn, saved.id, true).unwrap(),
+            "data:image/png;base64,RlVMTA=="
+        );
+    }
+
+    /// 文件名是从剪贴板/文件系统来的，带路径分隔符时不能被写到别的地方去
+    #[test]
+    fn safe_file_name_strips_paths_and_illegal_chars() {
+        assert_eq!(safe_file_name("C:\\Users\\a\\截图.png", 1), "截图.png");
+        assert_eq!(safe_file_name("../../etc/passwd", 1), "passwd");
+        assert_eq!(safe_file_name("a:b*c?.png", 1), "a_b_c_.png");
+        // 全被清空时退回一个兜底名字，不能拼出个空路径
+        assert_eq!(safe_file_name("...", 7), "附件-7");
+    }
+
+    /* ---- 附件与备份 / 恢复 ---- */
+
+    /// 备份要连图片一起带走，恢复要能原样还回来 —— 这正是把图片存进库的理由
+    #[test]
+    fn backup_and_restore_carry_attachments() {
+        let dir = tmp_dir("att-round");
+        let bak = dir.join("bak.db");
+
+        let mut live = db();
+        task(&live, "有留痕的工作");
+        let tid: i64 = live.last_insert_rowid();
+        insert_attachment(&live, tid, "聊天.png", "image/png", "image", &b64(b"CHAT"), Some(&b64(b"T")))
+            .unwrap();
+        write_backup(&live, &bak).expect("导出");
+
+        // 备份之后把附件删干净，再恢复
+        live.execute("DELETE FROM attachments", []).unwrap();
+        assert_eq!(count(&live, "attachments"), 0);
+
+        read_backup(&mut live, &bak).expect("恢复");
+
+        assert_eq!(count(&live, "attachments"), 1, "恢复后图片必须还在");
+        let id: i64 = live.query_row("SELECT id FROM attachments", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            attachment_data_url(&live, id, false).unwrap(),
+            "data:image/png;base64,Q0hBVA==",
+            "图片本体要一字不差地还回来"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 老版本（1.0.x / 1.1.x）建的备份里没有 attachments 表。
+    /// 这种备份必须照样能恢复 —— 为一张新增的表去拒绝，用户会平白丢掉全部数据。
+    #[test]
+    fn restore_accepts_an_old_backup_without_attachments() {
+        let dir = tmp_dir("att-old");
+        let bak = dir.join("old.db");
+
+        let live = db();
+        task(&live, "甲");
+        task(&live, "乙");
+        write_backup(&live, &bak).expect("导出");
+
+        // 把备份降级成「老版本」的样子
+        let old = Connection::open(&bak).unwrap();
+        old.execute("DROP TABLE attachments", []).unwrap();
+        drop(old);
+
+        let mut target = db();
+        task(&mut target, "恢复前就有的");
+        let tid: i64 = target.last_insert_rowid();
+        insert_attachment(&mut target, tid, "旧附件.png", "image/png", "image", &b64(b"OLD"), None).unwrap();
+
+        read_backup(&mut target, &bak).expect("老备份应当能恢复");
+
+        assert_eq!(count(&target, "tasks"), 2, "备份里的工作要回来");
+        assert_eq!(
+            count(&target, "attachments"),
+            0,
+            "备份里没有附件表，恢复后不该留着恢复前的那条孤儿"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

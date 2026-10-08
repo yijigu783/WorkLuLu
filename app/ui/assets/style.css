@@ -31,6 +31,10 @@
   --danger-bg: #FCEBEB;
   --danger-tx: #A32D2D;
 
+  /* 赞赏入口专用的暖色。全局唯一一处用它，只为和功能色区分开 */
+  --reward: #D6407B;
+  --reward-bg: #FDF2F6;
+
   --r-sm: 6px;
   --r-md: 8px;
   --r-lg: 10px;
@@ -90,6 +94,16 @@ button { cursor: pointer; }
 .brand-name { font-size: 13px; font-weight: 500; letter-spacing: .2px; }
 /* 开关之间的连带提醒：不是错误，是「这么设会有什么后果」，所以用琥珀色而非红色 */
 .warn-text { color: var(--p-once-tx); margin-top: 4px; }
+
+/* 「数据存放位置」卡片：便携徽标 + 路径行 + 右侧两个按钮。
+   路径可能很长（U 盘上的深目录），必须允许换行，否则会把按钮挤出卡片。 */
+.mode-chip {
+  display: inline-block; margin-left: 7px; padding: 1px 7px;
+  border-radius: 999px; font-size: 11px; font-weight: 600; vertical-align: 1px;
+  color: var(--primary); background: var(--primary-soft);
+}
+.path-line { font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
+.task-acts { display: flex; gap: 8px; flex-shrink: 0; }
 /* 英文副名：比中文主名轻一档，只是补充说明，不抢视线。
    标题栏（.brand-sub）和设置页「关于」（.name-en）共用同一套观感。 */
 .brand-sub, .name-en {
@@ -192,6 +206,29 @@ button { cursor: pointer; }
 .nav-heading button svg { width: 11px; height: 11px; }
 
 .sidebar-foot { margin-top: auto; padding-top: 10px; }
+
+/* 赞赏入口：放在主界面侧栏最下面，随手够得着，但刻意做得不起眼 ——
+   一旦做成高亮按钮，性质就从「感谢」变成「催收」了。
+   文案把「自愿、不影响功能」写在 title 里，鼠标停一下就看得见。 */
+.side-reward {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; height: 30px; padding: 0 9px; margin-top: 2px;
+  border-radius: var(--r-md);
+  font-size: 12.5px; color: var(--text-3);
+  transition: background .13s, color .13s;
+}
+.side-reward:hover { background: var(--reward-bg); color: var(--reward); }
+
+/* 贴边收起时，窗口只剩边缘几像素露在屏幕里。
+   那几像素是窗口自己的边缘，不铺个颜色的话，用户看到的是一条
+   说不清是什么的窄边 —— 不知道该不该去点它。 */
+body.edge-collapsed::after {
+  content: "";
+  position: fixed; top: 0; bottom: 0; width: 6px;
+  background: var(--primary);
+}
+body.edge-collapsed[data-edge-side="right"]::after { left: 0; }
+body.edge-collapsed[data-edge-side="left"]::after { right: 0; }
 
 /* ---------- 主内容区 ---------- */
 .content { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
@@ -379,6 +416,16 @@ mark { background: #FBECC2; color: inherit; border-radius: 2px; padding: 0 1px; 
 .cat-pill:hover { border-color: #D8DDE4; }
 .cat-pill.on { border-color: currentColor; font-weight: 500; }
 .cat-pill .swatch { width: 8px; height: 8px; border-radius: 50%; }
+
+/* 自动带上的分类（在分类页里新建时）：只占一行。
+   刻意做得比分类药丸「实」一点——它表达的是既成事实，不是待选的选项。 */
+.cat-fixed {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 28px; padding: 0 11px; border-radius: 999px;
+  background: var(--surface-3);
+  font-size: 12.5px; color: var(--text-1);
+}
+.cat-fixed .swatch { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 
 /* 星期几 / 几号 / 月份这类等宽选项。用网格而不是 flex 换行，
    7 列正好放下星期和 1–31 号，数字也能对齐成一列列看 */
@@ -777,6 +824,23 @@ mark { background: #FBECC2; color: inherit; border-radius: 2px; padding: 0 1px; 
   font-size: 11.5px; color: var(--text-3); margin-top: 3px;
   font-variant-numeric: tabular-nums;
 }
+
+/* 主界面「从模板新建」里挑模板的那一列。
+   整行可点，所以用 button 而不是卡片 + 按钮 —— 少一个点击目标，少一次犹豫。 */
+.tpl-pick-list { display: flex; flex-direction: column; gap: 6px; margin: 12px 0 4px; }
+.tpl-pick {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; padding: 11px 12px; text-align: left;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  transition: background .13s, border-color .13s, color .13s;
+}
+.tpl-pick:hover { background: var(--primary-soft); border-color: var(--primary); color: var(--primary); }
+.tpl-pick-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.tpl-pick-name { font-size: 13px; font-weight: 500; color: var(--text-1); }
+.tpl-pick-meta { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 .tpl-actions { display: flex; gap: 8px; flex: none; }
 .tpl-actions .btn { height: 32px; }
 
@@ -802,3 +866,99 @@ mark { background: #FBECC2; color: inherit; border-radius: 2px; padding: 0 1px; 
 }
 .reward-cap { font-size: 11.5px; color: var(--text-3); }
 
+
+/* ---------------- 附件（粘贴的图片 / 上传的文件） ---------------- */
+/* 投放区：粘贴和拖拽都落在这里。虚线边框是「可以往里放东西」的通用暗示，
+   拖拽悬停时换成主色，让人确认「松手会放在这儿」。 */
+.att-zone {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  transition: border-color .15s, background .15s;
+}
+.att-zone.drag { border-color: var(--primary); background: var(--primary-soft); }
+.att-zone-main {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; color: var(--text-3);
+}
+.att-zone-main .ic { width: 15px; height: 15px; }
+.att-zone kbd {
+  display: inline-block; padding: 0 4px; margin: 0 1px;
+  border: 1px solid var(--border); border-bottom-width: 2px;
+  border-radius: 4px; background: var(--surface);
+  font-family: inherit; font-size: 11px; color: var(--text-2);
+}
+
+.att-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr));
+  gap: 10px; margin-top: 10px;
+}
+.att-card { position: relative; min-width: 0; }
+.att-hit {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; aspect-ratio: 1 / 1;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface-2); overflow: hidden;
+  transition: border-color .14s, background .14s;
+}
+.att-hit:hover { border-color: var(--primary); background: var(--primary-soft); }
+.att-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+.att-file b {
+  font-size: 11px; font-weight: 500; letter-spacing: .4px;
+  color: var(--text-2);
+  padding: 3px 7px; border-radius: 5px; background: var(--surface-3);
+}
+.att-name {
+  display: block; margin-top: 4px;
+  font-size: 11px; color: var(--text-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* 删除按钮平时藏着，鼠标移上去才出来：一屏缩略图上挂一排叉号太吵 */
+.att-del {
+  position: absolute; top: -6px; right: -6px;
+  width: 20px; height: 20px; border-radius: 50%;
+  display: none; align-items: center; justify-content: center;
+  background: var(--text-1); color: #fff;
+  box-shadow: 0 1px 4px rgba(20, 26, 40, .22);
+}
+.att-del svg { width: 10px; height: 10px; }
+.att-card:hover .att-del { display: flex; }
+
+/* ---------------- 附件大图预览 ---------------- */
+/* 聊天截图常常又长又窄，所以用 contain 而不是 cover：
+   宁可两边留白，也不能把内容裁掉——裁掉的可能正是要留痕的那句话。 */
+.lightbox {
+  position: fixed; inset: 0; z-index: 70;
+  display: none; flex-direction: column;
+  background: rgba(16, 20, 28, .82);
+}
+.lightbox.open { display: flex; }
+.lightbox-bar {
+  flex: none; height: 46px;
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 14px; color: #fff;
+}
+.lightbox-name {
+  flex: 1; min-width: 0; font-size: 12.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.lightbox-bar .icon-btn { color: #fff; }
+.lightbox-bar .icon-btn:hover { background: rgba(255, 255, 255, .16); color: #fff; }
+.lightbox-img {
+  flex: 1; min-height: 0; width: 100%;
+  object-fit: contain; padding: 0 16px 18px;
+}
+
+/* 「有留痕」的小标记。挂在列表行和看板卡的元信息后面，
+   做成中性灰而不是彩色徽章：它是提示不是状态，不该和「已逾期」抢注意力。 */
+.att-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  margin-left: 6px; padding: 0 5px;
+  border-radius: 5px; background: var(--surface-3);
+  font-size: 11px; line-height: 16px; color: var(--text-2);
+  vertical-align: middle;
+}
+.att-badge svg { width: 11px; height: 11px; flex: none; }

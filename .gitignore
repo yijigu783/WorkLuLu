@@ -35,9 +35,30 @@
 /app/tools/_preview/
 /app/tools/_p*/
 /app/tools/_m_*/
+# make_preview / smoke 生成的一次性静态副本，跑一次就重新生成，没有留存价值
+/app/out/
 
 # 本地工作笔记，不适合公开
 /.workbuddy/
+# 助手的工作记忆（项目日志与长期笔记）—— 是本机工作数据，不是项目源码
+/.workbuddy-ai/
+
+# 视频成片与配音 —— 百兆级二进制，和 exe 一样走 Releases / 网盘，不进仓库。
+# 脚本和文案（lines.py / make_film.py / 分镜脚本.txt / 投稿文案.txt）要提交。
+/docs/bilibili-video/*.mp4
+/docs/bilibili-video/voices/
+/docs/bilibili-video/试听-全片配音.mp3
+/docs/bilibili-video/_check/
+/docs/bilibili-video/_probe.json
+
+# 根目录的调试残留（探针脚本、临时输出、便携模式试跑目录）
+/_edge_drag*.py
+/_edge_drag*.txt
+/_evt.txt
+/_wv2.txt
+/_t/
+# 外部下载的参考资料，不属于本项目
+/bugbounty/
 
 # 编辑器与系统
 .vscode/

@@ -1,6 +1,6 @@
 [package]
 name = "worklog"
-version = "1.2.0"
+version = "1.6.0"
 description = "工作记录本 (WorkLuLu) - 单文件绿色的本地工作记录与周期排期工具"
 authors = ["JJAI"]
 edition = "2021"
@@ -24,6 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = "0.4"
+# 附件（粘贴的图片 / 上传的文件）走 JSON 传递，二进制得先编成 base64 文本。
+# 这个 crate 本来就在依赖树里（tauri 间接用），显式声明不增加编译量。
+base64 = "0.22"
 # 三端共享业务层（数据模型 + 周期排期引擎）。安卓版依赖同一个 crate，
 # 排期算法因此只有一份实现 —— 见 core/src/lib.rs 顶部的三条纪律。
 worklog-core = { path = "../../core" }
@@ -46,6 +49,20 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     # RegCreateKeyExW 的签名里带 SECURITY_ATTRIBUTES，整个函数被这个特性门控着
     "Win32_Security",
+    # 下面三个是窗口行为（src/win32.rs、src/snap.rs、src/single.rs）需要的：
+    #   Win32_Graphics_Gdi            MonitorFromWindow / GetMonitorInfoW —— 拿工作区，
+    #                                 吸附才能避开任务栏而不是压在它上面
+    #   Win32_UI_WindowsAndMessaging FindWindowW / SetForegroundWindow / AttachThreadInput
+    #                                 / SetWindowPos / GetWindowRect —— 找旧窗口、请到前台、
+    #                                 把滑出屏幕的窗口挪回来
+    #   Win32_System_Threading        CreateMutexW / GetCurrentThreadId —— 单实例互斥体
+    #   Win32_UI_Input_KeyboardAndMouse
+    #                                 GetAsyncKeyState —— 贴边隐藏要问「左键还按着吗」，
+    #                                 拖动中不能把窗口滑走
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 # 注意：[profile.release] 已提到工作区根（仓库根的 Cargo.toml）。

@@ -2,7 +2,12 @@
 
 mod commands;
 mod db;
+mod edge;
+mod geom;
 mod notify;
+mod single;
+mod snap;
+mod win32;
 
 use rusqlite::{params, OptionalExtension};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -33,6 +38,9 @@ static TRAY_SIGNATURE: AtomicI64 = AtomicI64::new(-1);
 
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
+    /// 启动时若刚把数据搬进/搬出便携目录，这里留一句话给界面显示一次。
+    /// 不用事件是因为 setup 里发事件时前端多半还没开始监听，消息会直接丢掉。
+    pub portable_note: Mutex<Option<String>>,
 }
 
 fn show_main(app: &tauri::AppHandle) {
@@ -40,6 +48,11 @@ fn show_main(app: &tauri::AppHandle) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+        // 贴边隐藏开着的时候，窗口可能整个滑在屏幕外：show + 焦点都给了，
+        // 用户眼前还是什么都没有。顺手把它请回屏幕内。
+        if let Ok(hwnd) = w.as_ref().window().hwnd() {
+            win32::pull_into_view(hwnd);
+        }
     }
 }
 
@@ -274,6 +287,12 @@ fn spawn_reminder_loop(app: tauri::AppHandle) {
 }
 
 fn main() {
+    // 单实例：已经有实例在跑，就把它请到前台，本次进程直接结束。
+    // 必须排在最前面 —— 数据库是 SQLite 文件，两个进程同时开它会互相锁，
+    // 便携目录的搬迁也会打架。
+    if !single::claim() {
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
@@ -285,10 +304,41 @@ fn main() {
         // 不需要 npm 侧的 @tauri-apps/plugin-dialog。
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let conn = db::init(app.handle())?;
-            app.manage(AppState { db: Mutex::new(conn) });
+            // 便携模式的搬迁必须在开库之前做 —— 那时候数据库文件还没被连接占着，搬得动。
+            // 用户可能是在设置里点的「切为便携模式」，也可能只是手建了个 data 目录。
+            let portable_note = db::migrate_into_portable(app.handle());
+
+            // 开库失败不让它 panic。交付的是 GUI 子系统（没有控制台），
+            // panic=abort 的 release 里这一下会静默结束进程 ——
+            // 用户看到的就是「双击了，什么都没发生」，连报错都没处看。
+            let conn = match db::init(app.handle()) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    let dir = db::data_dir(app.handle());
+                    win32::error_box(
+                        APP_NAME,
+                        &format!(
+                            "打不开数据文件，程序没法启动。\n\n\
+                             位置：{}\n\
+                             原因：{e}\n\n\
+                             常见原因是这个位置没有写入权限（比如程序被放在 \
+                             Program Files、只读的 U 盘或光盘里）。\n\
+                             把程序换到桌面或自己建的文件夹再试；也可以检查一下\
+                             是不是杀毒软件把数据目录拦住了。",
+                            dir.display()
+                        ),
+                    );
+                    std::process::exit(1);
+                }
+            };
+            app.manage(AppState {
+                db: Mutex::new(conn),
+                portable_note: Mutex::new(portable_note),
+            });
 
             spawn_reminder_loop(app.handle().clone());
+            // 贴边隐藏靠后台轮询采样判定（鼠标位置和左键状态没有事件可听）
+            edge::spawn_watch(app.handle().clone());
 
             /* ---- 系统通知的身份 ---- */
             // 绿色 exe 没被安装过，系统不知道「工作记录本」是谁，
@@ -343,8 +393,8 @@ fn main() {
         })
         /* 关闭窗口 = 收进托盘继续跑，保证到期提醒不丢；
            但用户在设置里关掉了托盘常驻，就按普通的关窗处理 */
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
                 let keep_running = {
                     let state = window.app_handle().state::<AppState>();
                     // 绑成局部变量：直接写在块尾的话，MutexGuard 会活过 state 的借用期
@@ -359,6 +409,15 @@ fn main() {
                     let _ = window.hide();
                 }
             }
+            // 拖动窗口。吸附挂在这里；贴边隐藏不挂 —— 它的判定要用鼠标的绝对位置
+            // 和左键状态，那些没有事件可听，改由 `edge::spawn_watch` 轮询。
+            // 吸附本身在贴边隐藏开着时就自我禁用（`snap::enabled`），两者不会打架。
+            WindowEvent::Moved(_) => {
+                snap::on_moved(window);
+            }
+            // 从任务栏或 Alt+Tab 回到窗口：要是它正滑在屏幕外，得先滑回来
+            WindowEvent::Focused(true) => edge::on_focused(window),
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_categories,
@@ -379,14 +438,21 @@ fn main() {
             commands::save_template,
             commands::apply_template,
             commands::delete_template,
+            commands::list_attachments,
+            commands::add_attachment,
+            commands::get_attachment,
+            commands::delete_attachment,
+            commands::open_attachment,
             commands::skip_occurrence,
             commands::list_completions,
             commands::undo_completion,
             commands::get_settings,
             commands::set_setting,
-            commands::data_dir,
+            commands::data_info,
+            commands::set_portable,
             commands::app_version,
             commands::open_data_dir,
+            commands::edge_reset,
             commands::backup_to,
             commands::restore_from,
             commands::export_csv,
